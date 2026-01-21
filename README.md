@@ -1,5 +1,10 @@
 # 🛡️ ShielderX
 
+## Website
+
+https://forgwhiz.github.io/ShielderX/
+
+
 **Protect secrets from AI vibe-coding tools — without breaking your app.**
 
 ShielderX is a **local security boundary** for modern development workflows.  

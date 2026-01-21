@@ -3,12 +3,12 @@
   "displayName": "ShielderX",
   "publisher": "shielderx",
   "description": "AI-powered secret protection for VS Code. Prevent accidental leaks and protect API keys before AI tools read your files.",
-  "version": "0.0.4",
+  "version": "0.0.6",
   "icon": "icon.png",
   "engines": {
     "vscode": "^1.85.0"
   },
-
+  "homepage": "https://forgwhiz.github.io/ShielderX/",
   "galleryBanner": {
     "color": "#1e1e1e",
     "theme": "dark"
