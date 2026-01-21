@@ -1,0 +1,64 @@
+{
+  "name": "shielderx",
+  "displayName": "ShielderX",
+  "publisher": "shielderx",
+  "description": "AI-powered secret protection for VS Code. Prevent accidental leaks and protect API keys before AI tools read your files.",
+  "version": "0.0.3",
+  "icon": "icon.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+
+  "galleryBanner": {
+    "color": "#1e1e1e",
+    "theme": "dark"
+  },
+  "activationEvents": ["*"],
+"main": "./extension.js",
+"contributes": {
+  "commands": [
+    {
+      "command": "shielder.scan",
+      "title": "ShielderX: Scan Project"
+    },
+     {
+      "command": "shielder.manageSecrets",
+      "title": "ShielderX: Manage Secrets"
+    },
+    {
+      "command": "shielder.exportKey",
+      "title": "ShielderX: Export Project Key"
+    },
+    {
+      "command": "shielder.rotateKey",
+      "title": "ShielderX: Rotate Project Key"
+    }
+  ]
+},
+ "categories": [
+    "Programming Languages",
+    "AI",
+    "Other"
+  ],
+
+  "keywords": [
+    "AI",
+    "security",
+    "secrets",
+    "protection",
+    "shield",
+    "mask",
+    "secure",
+    "LLM",
+    "env",
+    "safety",
+    "devops",
+    "compliance",
+    "code-security",
+    "copilot-safe",
+    "chatgpt-safe",
+    "AI-security",
+    "secret-detection",
+    "secret-protection"
+  ]
+}
