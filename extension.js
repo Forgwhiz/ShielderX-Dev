@@ -1174,6 +1174,8 @@ async function handleWorkspaceOpen() {
 
   const config = vscode.workspace.getConfiguration("shielder");
   const autoProtect = config.get("autoProtectOnOpen", false);
+const alreadyShown = context.workspaceState.get("shielder.warningShown", false);
+
 
   // ─────────────────────────────
   // 1️⃣ AUTO PROTECT (OPT-IN)
@@ -1225,9 +1227,15 @@ async function handleWorkspaceOpen() {
     } catch { }
   }
 
-  if (!suspicious) return;
+ // Show warning if suspicious OR first-time open
+if (!suspicious && alreadyShown) return;
 
-  openOnOpenWarning(ws);
+openOnOpenWarning(ws);
+
+// persist flag (workspace-level)
+await context.workspaceState.update("shielder.warningShown", true);
+
+
 }
 
 
