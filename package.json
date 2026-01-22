@@ -3,7 +3,7 @@
   "displayName": "ShielderX",
   "publisher": "shielderx",
   "description": "AI-powered secret protection for VS Code. Prevent accidental leaks and protect API keys before AI tools read your files.",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "icon": "icon.png",
   "engines": {
     "vscode": "^1.85.0"

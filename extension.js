@@ -56,27 +56,71 @@ async function generateProjectFingerprint(workspaceFolder) {
 /*********************************
  * KEY MANAGEMENT
  *********************************/
+// async function ensureProjectKey(workspaceFolder) {
+//   const uri = vscode.Uri.joinPath(workspaceFolder.uri, PROJECT_KEY_FILE);
+//   try {
+//     await vscode.workspace.fs.readFile(uri);
+//     vscode.window.showInformationMessage("🔑 Project key already exists");
+//   } catch {
+//     const key = crypto.randomBytes(32);
+//     await vscode.workspace.fs.writeFile(uri, key);
+//     vscode.window.showWarningMessage(
+//       "🔐 Project key generated. Backup `.shielder.key`. Losing it = losing secrets."
+//     );
+//   }
+// }
+
+// New logic 
 async function ensureProjectKey(workspaceFolder) {
   const uri = vscode.Uri.joinPath(workspaceFolder.uri, PROJECT_KEY_FILE);
+
   try {
+    // If file exists, do nothing
     await vscode.workspace.fs.readFile(uri);
     vscode.window.showInformationMessage("🔑 Project key already exists");
+    return;
   } catch {
+    // Generate strong random key
     const key = crypto.randomBytes(32);
-    await vscode.workspace.fs.writeFile(uri, key);
+
+    // Add a binary header so editors don't treat it as text
+    const header = Buffer.from("SHIELDER_KEY_v1\n", "utf8");
+    const payload = Buffer.concat([header, key]);
+
+    await vscode.workspace.fs.writeFile(uri, payload);
+
     vscode.window.showWarningMessage(
       "🔐 Project key generated. Backup `.shielder.key`. Losing it = losing secrets."
     );
   }
 }
 
+
+// async function getProjectKey(workspaceFolder) {
+//   return Buffer.from(
+//     await vscode.workspace.fs.readFile(
+//       vscode.Uri.joinPath(workspaceFolder.uri, PROJECT_KEY_FILE)
+//     )
+//   );
+// }
+
+
+
 async function getProjectKey(workspaceFolder) {
-  return Buffer.from(
-    await vscode.workspace.fs.readFile(
-      vscode.Uri.joinPath(workspaceFolder.uri, PROJECT_KEY_FILE)
-    )
-  );
+  const uri = vscode.Uri.joinPath(workspaceFolder.uri, PROJECT_KEY_FILE);
+  const raw = await vscode.workspace.fs.readFile(uri);
+
+  const header = Buffer.from("SHIELDER_KEY_v1\n", "utf8");
+
+  // Validate header
+  if (!raw.slice(0, header.length).equals(header)) {
+    throw new Error("Invalid or corrupted Shielder key file");
+  }
+
+  // Return only the real key bytes
+  return raw.slice(header.length);
 }
+
 
 /*********************************
  * ENCRYPT / DECRYPT HELPERS
@@ -171,16 +215,132 @@ function detect(text) {
 /*********************************
  * EXTENSION
  *********************************/
+
+function setupProtectionWatchers(context) {
+  // ─────────────────────────────
+  // FILE SYSTEM WATCHERS
+  // ─────────────────────────────
+  const keyWatcher = vscode.workspace.createFileSystemWatcher(
+    `**/${PROJECT_KEY_FILE}`
+  );
+
+  const storeWatcher = vscode.workspace.createFileSystemWatcher(
+    `**/${SECRET_FILE}`
+  );
+
+  // 🔐 Key modified externally (no modal — edit is already blocked in editor)
+  keyWatcher.onDidChange(() => {
+    console.warn("Shielder: key file modified externally");
+  });
+
+  // 🔐 Key deleted (CRITICAL → modal)
+  keyWatcher.onDidDelete(() => {
+    vscode.window.showErrorMessage(
+      "🚨 Shielder key was deleted!\n\nSecrets can no longer be decrypted unless the key is restored.",
+      { modal: true },
+      "Learn more",
+      "OK"
+    ).then(selection => {
+      if (selection === "Learn more") {
+        openShielderIncidentWebview("key-deleted");
+      }
+    });
+  });
+
+  // 📦 Store modified externally (silent / optional)
+  storeWatcher.onDidChange(() => {
+    console.warn("Shielder: secret store modified externally");
+  });
+
+  // 📦 Store deleted (CRITICAL → modal)
+  storeWatcher.onDidDelete(() => {
+    vscode.window.showErrorMessage(
+      "🚨 Secret store was deleted!\n\nProtection state is lost unless restored.",
+      { modal: true },
+      "Learn more",
+      "OK"
+    ).then(selection => {
+      if (selection === "Learn more") {
+        openShielderIncidentWebview("store-deleted");
+      }
+    });
+  });
+
+  context.subscriptions.push(keyWatcher, storeWatcher);
+}
+
+
+let blockingDialogActive = false;
+
+
+function handleManagedFileOpen(editor) {
+  if (!editor) return;
+
+  const file = editor.document.fileName;
+  const fileName = path.basename(file);
+
+  if (
+    file.endsWith(PROJECT_KEY_FILE) ||
+    file.endsWith(SECRET_FILE)
+  ) {
+    if (blockingDialogActive) return;
+    blockingDialogActive = true;
+
+    vscode.window.showWarningMessage(
+      `🔒 Protected file detected
+
+File: ${fileName}
+
+This file is managed by Shielder.
+Manual editing is not allowed and changes will be reverted automatically.`,
+      { modal: true },
+      "OK"
+    ).then(() => {
+      blockingDialogActive = false;
+      vscode.commands.executeCommand(
+        "workbench.action.closeActiveEditor"
+      );
+    });
+  }
+}
+
+
+
 function activate(context) {
+setupProtectionWatchers(context);
+  // also run once on activation
+  handleWorkspaceOpen(context);
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeWorkspaceFolders(async () => {
-      await handleWorkspaceOpen();
+      await handleWorkspaceOpen(context);
     })
   );
 
-  // also run once on activation
-  handleWorkspaceOpen();
+
+  // ─────────────────────────────
+// BLOCK MANAGED FILES ON OPEN
+// ─────────────────────────────
+// Block managed files on open / focus
+context.subscriptions.push(
+  vscode.workspace.onDidOpenTextDocument(doc => {
+    const editor = vscode.window.visibleTextEditors.find(
+      e => e.document === doc
+    );
+    handleManagedFileOpen(editor);
+  })
+);
+
+context.subscriptions.push(
+  vscode.window.onDidChangeActiveTextEditor(editor => {
+    handleManagedFileOpen(editor);
+  })
+);
+
+// Setup file watchers
+setupProtectionWatchers(context);
+
+
 
 
   context.subscriptions.push(
@@ -398,6 +558,20 @@ function activate(context) {
   );
 }
 
+
+
+function openShielderIncidentWebview(type) {
+  const panel = vscode.window.createWebviewPanel(
+    "shielderIncident",
+    "ShielderX — Security Notice",
+    vscode.ViewColumn.One,
+    { enableScripts: false }
+  );
+
+  panel.webview.html = getShielderIncidentHTML(type);
+}
+
+
 function openManageSecrets(ws) {
   const panel = vscode.window.createWebviewPanel(
     "shielderManageSecrets",
@@ -612,6 +786,106 @@ async function findCurrentLine(ws, secret) {
 }
 
 
+function getShielderIncidentHTML(type) {
+  let title = "";
+  let message = "";
+
+  switch (type) {
+    case "key-deleted":
+      title = "Shielder Key Deleted";
+      message = `
+        <p>The <code>.shielder.key</code> file was deleted.</p>
+        <p>This key is required to decrypt all protected secrets.</p>
+        <p><strong>Without this key, secrets cannot be recovered.</strong></p>
+        <p>If you have a backup, restore it immediately.</p>
+      `;
+      break;
+
+    case "key-modified":
+      title = "Shielder Key Modified";
+      message = `
+        <p>The <code>.shielder.key</code> file was modified manually.</p>
+        <p>This may cause decryption failures or corrupted secrets.</p>
+        <p>Restore the original key if possible.</p>
+      `;
+      break;
+
+    case "store-deleted":
+      title = "Secret Store Deleted";
+      message = `
+        <p>The <code>.ai-secret-guard.json</code> file was deleted.</p>
+        <p>This file tracks protected secrets and placeholders.</p>
+        <p>Protection state is now lost.</p>
+      `;
+      break;
+
+    case "store-modified":
+      title = "Secret Store Modified";
+      message = `
+        <p>The secret store was edited outside Shielder.</p>
+        <p>This may corrupt secret mappings or placeholders.</p>
+        <p>Proceed carefully.</p>
+      `;
+      break;
+  }
+
+  return `
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<style>
+  body {
+    margin: 0;
+    padding: 0;
+    background: #0f1115;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #e6e6eb;
+  }
+  .card {
+    max-width: 640px;
+    margin: 48px auto;
+    background: #161a22;
+    border-radius: 14px;
+    padding: 28px;
+    box-shadow: 0 20px 40px rgba(0,0,0,.45);
+  }
+  h1 {
+    margin-top: 0;
+    font-size: 20px;
+  }
+  p {
+    line-height: 1.6;
+    color: #cfd3ff;
+  }
+  code {
+    background: #222634;
+    padding: 3px 6px;
+    border-radius: 6px;
+    color: #9aa4ff;
+  }
+  .btn {
+    margin-top: 24px;
+    padding: 10px 18px;
+    border-radius: 10px;
+    border: none;
+    background: linear-gradient(135deg, #6e7bff, #8f9bff);
+    color: #0f1115;
+    font-weight: 600;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>${title}</h1>
+    ${message}
+    <button class="btn" onclick="window.close()">OK</button>
+  </div>
+</body>
+</html>
+`;
+}
 
 
 function getManageSecretsHTML() {
@@ -1168,13 +1442,19 @@ function getExportKeyHTML() {
 //   openOnOpenWarning(ws);
 // }
 
-async function handleWorkspaceOpen() {
+async function handleWorkspaceOpen(context) {
+
   const ws = vscode.workspace.workspaceFolders?.[0];
   if (!ws) return;
 
   const config = vscode.workspace.getConfiguration("shielder");
   const autoProtect = config.get("autoProtectOnOpen", false);
-const alreadyShown = context.workspaceState.get("shielder.warningShown", false);
+// const alreadyShown = context.workspaceState.get("shielder.warningShown", false);
+
+const alreadyShown = context.workspaceState.get(
+  "shielder.warningShown",
+  false
+);
 
 
   // ─────────────────────────────
