@@ -7,6 +7,10 @@
  * - Temporary in-memory decrypt is allowed ONLY for key rotation.
  *********************************/
 
+
+
+
+
 const vscode = require("vscode");
 const path = require("path");
 const crypto = require("crypto");
@@ -29,9 +33,25 @@ const STRING_ASSIGN_REGEX =
   /\b(const|let|var)\s+([A-Za-z0-9_]+)\s*=\s*["'`]([^"'`]+)["'`]/g;
 
 
+
+  const internalFsOps = new Set();
+
+const SHIELDER_INTERNAL_FILES = new Set([
+  PROJECT_KEY_FILE,          // .shielder.key
+  SECRET_FILE                // .ai-secret-guard.json
+]);
+
 /*********************************
  * FINGERPRINT (DAY 9.3)
  *********************************/
+
+function shouldSkipScanFile(uri) {
+  const fileName = uri.fsPath.split("/").pop();
+  return SHIELDER_INTERNAL_FILES.has(fileName);
+}
+
+
+
 async function generateProjectFingerprint(workspaceFolder) {
   const rootPath = workspaceFolder.uri.fsPath;
 
@@ -228,13 +248,11 @@ function setupProtectionWatchers(context) {
     `**/${SECRET_FILE}`
   );
 
-  // 🔐 Key modified externally (no modal — edit is already blocked in editor)
-  keyWatcher.onDidChange(() => {
-    console.warn("Shielder: key file modified externally");
-  });
+
 
   // 🔐 Key deleted (CRITICAL → modal)
-  keyWatcher.onDidDelete(() => {
+  keyWatcher.onDidDelete((uri) => {
+    if (isInternalOp(uri)) return;
     vscode.window.showErrorMessage(
       "🚨 Shielder key was deleted!\n\nSecrets can no longer be decrypted unless the key is restored.",
       { modal: true },
@@ -247,13 +265,10 @@ function setupProtectionWatchers(context) {
     });
   });
 
-  // 📦 Store modified externally (silent / optional)
-  storeWatcher.onDidChange(() => {
-    console.warn("Shielder: secret store modified externally");
-  });
-
+ 
   // 📦 Store deleted (CRITICAL → modal)
-  storeWatcher.onDidDelete(() => {
+  storeWatcher.onDidDelete((uri) => {
+    if (isInternalOp(uri)) return;
     vscode.window.showErrorMessage(
       "🚨 Secret store was deleted!\n\nProtection state is lost unless restored.",
       { modal: true },
@@ -304,6 +319,15 @@ Manual editing is not allowed and changes will be reverted automatically.`,
   }
 }
 
+async function loadExistingSecretFile(ws) {
+  const uri = vscode.Uri.joinPath(ws.uri, ".ai-secret-guard.json");
+
+  const raw = await vscode.workspace.fs.readFile(uri);
+  return {
+    uri,
+    data: JSON.parse(raw.toString())
+  };
+}
 
 
 function activate(context) {
@@ -337,10 +361,21 @@ context.subscriptions.push(
   })
 );
 
-// Setup file watchers
-setupProtectionWatchers(context);
 
+context.subscriptions.push(
+  vscode.commands.registerCommand("shielder.revertProject", async () => {
+    const ws = vscode.workspace.workspaceFolders?.[0];
+    if (!ws) return;
+     // ✅ DECLARE it properly
+    const protectedProject = await isProjectProtected(ws);
 
+    if (!protectedProject) {
+      openNotProtectedWebview(ws);
+      return;
+    }
+    openRevertConfirm(context, ws);
+  })
+);
 
 
   context.subscriptions.push(
@@ -356,21 +391,28 @@ setupProtectionWatchers(context);
   );
 
 
-  context.subscriptions.push(
-    vscode.commands.registerCommand("shielder.manageSecrets", async () => {
-      const ws = vscode.workspace.workspaceFolders?.[0];
-      if (!ws) {
-        vscode.window.showWarningMessage("No workspace open");
-        return;
-      }
-      openManageSecrets(ws);
-    })
-  );
+context.subscriptions.push(
+  vscode.commands.registerCommand("shielder.manageSecrets", async () => {
+    const ws = vscode.workspace.workspaceFolders?.[0];
+    if (!ws) return;
+
+    // ✅ DECLARE it properly
+    const protectedProject = await isProjectProtected(ws);
+
+    if (!protectedProject) {
+      openNotProtectedWebview(ws);
+      return;
+    }
+   openManageSecrets(ws);
+  })
+);
+
 
 
   /* -------- SCAN PROJECT -------- */
   context.subscriptions.push(
     vscode.commands.registerCommand("shielder.scan", async () => {
+       await context.workspaceState.update("shielder.reverted", false);
       const ws = vscode.workspace.workspaceFolders?.[0];
       if (!ws) {
         vscode.window.showWarningMessage(
@@ -396,6 +438,7 @@ setupProtectionWatchers(context);
       let detectedAny = false;
 
       for (const file of files) {
+        if (shouldSkipScanFile(file)) continue;
         try {
           const text = (await vscode.workspace.fs.readFile(file)).toString();
           let updated = text;
@@ -1404,6 +1447,8 @@ function getExportKeyHTML() {
 </html>`;
 }
 
+
+
 // async function handleWorkspaceOpen() {
 //   const ws = vscode.workspace.workspaceFolders?.[0];
 //   if (!ws) return;
@@ -1442,7 +1487,12 @@ function getExportKeyHTML() {
 //   openOnOpenWarning(ws);
 // }
 
+
 async function handleWorkspaceOpen(context) {
+
+const reverted = context.workspaceState.get("shielder.reverted", false);
+if (reverted) return;
+
 
   const ws = vscode.workspace.workspaceFolders?.[0];
   if (!ws) return;
@@ -1744,8 +1794,407 @@ function getOnOpenWarningHTML() {
 </html>`;
 }
 
+/*
+
+  Revert Project logic
+
+*/
+
+async function revertProject(context, ws) {
+  const storeUri = vscode.Uri.joinPath(ws.uri, SECRET_FILE);
+  const keyUri = vscode.Uri.joinPath(ws.uri, PROJECT_KEY_FILE);
+
+  let store;
+
+  // 1️⃣ Load existing secret store (DO NOT auto-create)
+  try {
+    const raw = await vscode.workspace.fs.readFile(storeUri);
+    store = JSON.parse(raw.toString());
+  } catch {
+    vscode.window.showWarningMessage(
+      "No protected secrets found to revert."
+    );
+    return;
+  }
+
+  const key = await getProjectKey(ws);
+
+  // 2️⃣ Restore secrets back into source files
+  for (const s of store.secrets) {
+    const fileUri = vscode.Uri.joinPath(ws.uri, s.file);
+    let content = (await vscode.workspace.fs.readFile(fileUri)).toString();
+
+    const plaintext = decryptWithKey(key, s.encrypted);
+
+    // resolveSecret("PLACEHOLDER") → "plaintext"
+    content = content.replace(
+      new RegExp(`resolveSecret\\(["']${s.placeholder}["']\\)`, "g"),
+      `"${plaintext}"`
+    );
+
+    // remove runtime import if present
+    content = content.replace(
+      /import\s+\{\s*resolveSecret\s*\}\s+from\s+["']@shielder\/runtime["'];?\n?/g,
+      ""
+    );
+
+    await vscode.workspace.fs.writeFile(
+      fileUri,
+      Buffer.from(content)
+    );
+  }
+
+  // 3️⃣ Mark internal deletes (CRITICAL)
+  markInternalOp(keyUri);
+  markInternalOp(storeUri);
+
+  try {
+    await vscode.workspace.fs.delete(keyUri);
+  } catch {}
+
+  try {
+    await vscode.workspace.fs.delete(storeUri);
+  } catch {}
+
+  // 4️⃣ Unmark after delete
+  unmarkInternalOp(keyUri);
+  unmarkInternalOp(storeUri);
+
+  // 5️⃣ Remember that user explicitly reverted this project
+  await context.workspaceState.update("shielder.reverted", true);
+
+  // 6️⃣ Friendly confirmation
+  vscode.window.showInformationMessage(
+    "Shielder protection removed. Secrets restored to source code.",
+    "Re-Protect"
+  ).then(choice => {
+    if (choice === "Re-Protect") {
+      vscode.commands.executeCommand("shielder.scan");
+    }
+  });
+}
 
 
+
+function openRevertConfirm(context, ws) {
+  const panel = vscode.window.createWebviewPanel(
+    "shielderRevertConfirm",
+    "Shielder — Revert Protection",
+    vscode.ViewColumn.Active,
+    { enableScripts: true }
+  );
+
+  panel.webview.html = getRevertConfirmHTML();
+
+  panel.webview.onDidReceiveMessage(async msg => {
+    if (msg.type === "cancel") {
+      panel.dispose();
+      return;
+    }
+
+    if (msg.type === "revert") {
+      panel.dispose();
+      await revertProject(context, ws);
+    }
+  });
+}
+function getRevertConfirmHTML() {
+  return `
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<style>
+  body {
+    margin: 0;
+    font-family: var(--vscode-font-family);
+    background: rgba(0,0,0,0.55);
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .card {
+    width: 520px;
+    background: var(--vscode-editor-background);
+    border-radius: 14px;
+    padding: 26px 28px;
+    box-shadow: 0 30px 80px rgba(0,0,0,0.75);
+    border: 1px solid rgba(255,120,120,0.35);
+  }
+
+  h2 {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 600;
+  }
+
+  .desc {
+    margin-top: 12px;
+    font-size: 13px;
+    line-height: 1.55;
+    opacity: 0.9;
+  }
+
+  ul {
+    margin: 14px 0;
+    padding-left: 18px;
+    font-size: 13px;
+  }
+
+  .note {
+    font-size: 12px;
+    opacity: 0.8;
+    margin-top: 10px;
+  }
+
+  .actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 12px;
+    margin-top: 22px;
+  }
+
+  button {
+    padding: 8px 16px;
+    font-size: 13px;
+    border-radius: 8px;
+    border: none;
+    cursor: pointer;
+  }
+
+  .secondary {
+    background: transparent;
+    border: 1px solid var(--vscode-editorGroup-border);
+    color: var(--vscode-editor-foreground);
+  }
+
+  .danger {
+    background: #d16969;
+    color: white;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.45);
+  }
+</style>
+</head>
+
+<body>
+  <div class="card">
+    <h2>⚠️ Revert Shielder Protection</h2>
+
+    <div class="desc">
+      This will completely remove Shielder protection from this project.
+    </div>
+
+    <ul>
+      <li>Secrets will be restored into source code</li>
+      <li>Shielder files will be deleted</li>
+      <li>AI tools will be able to read secrets</li>
+    </ul>
+
+    <div class="note">
+      You can re-enable protection anytime by running <b>Scan Project</b>.
+    </div>
+
+    <div class="actions">
+      <button class="secondary" onclick="cancel()">Cancel</button>
+      <button class="danger" onclick="revert()">Revert & Remove</button>
+    </div>
+  </div>
+
+<script>
+  const vscode = acquireVsCodeApi();
+
+  function cancel() {
+    vscode.postMessage({ type: "cancel" });
+  }
+
+  function revert() {
+    vscode.postMessage({ type: "revert" });
+  }
+</script>
+</body>
+</html>`;
+}
+
+
+function normalizePath(p) {
+  return p.replace(/\\/g, "/").toLowerCase();
+}
+
+function markInternalOp(uri) {
+  internalFsOps.add(normalizePath(uri.fsPath));
+}
+
+function unmarkInternalOp(uri) {
+  internalFsOps.delete(normalizePath(uri.fsPath));
+}
+
+function isInternalOp(uri) {
+  const path = normalizePath(uri.fsPath);
+
+  // direct match
+  if (internalFsOps.has(path)) return true;
+
+  // fallback: filename-based match (VERY IMPORTANT)
+  const name = path.split("/").pop();
+  return (
+    name === PROJECT_KEY_FILE.toLowerCase() ||
+    name === SECRET_FILE.toLowerCase()
+  );
+}
+
+
+async function isProjectProtected(ws) {
+  try {
+    const keyUri = vscode.Uri.joinPath(ws.uri, PROJECT_KEY_FILE);
+    const storeUri = vscode.Uri.joinPath(ws.uri, SECRET_FILE);
+
+    await vscode.workspace.fs.stat(keyUri);
+    await vscode.workspace.fs.stat(storeUri);
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+
+function openNotProtectedWebview(ws) {
+  const panel = vscode.window.createWebviewPanel(
+    "shielderNotProtected",
+    "Shielder — Project Not Protected",
+    vscode.ViewColumn.Active,
+    { enableScripts: true }
+  );
+
+  panel.webview.html = getNotProtectedHTML();
+
+  panel.webview.onDidReceiveMessage(msg => {
+    if (msg.type === "cancel") {
+      panel.dispose();
+      return;
+    }
+
+    if (msg.type === "protect") {
+      panel.dispose();
+      vscode.commands.executeCommand("shielder.scan");
+    }
+  });
+}
+
+
+function getNotProtectedHTML() {
+  return `
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<style>
+  body {
+    margin: 0;
+    font-family: var(--vscode-font-family);
+    background: rgba(0,0,0,0.55);
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+ .danger {
+    background: #d16969;
+    color: white;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.45);
+  }
+  .card {
+    width: 520px;
+    background: var(--vscode-editor-background);
+    border-radius: 14px;
+    padding: 26px 28px;
+    box-shadow: 0 30px 80px rgba(0,0,0,0.75);
+    border: 1px solid rgba(255, 193, 7, 0.35);
+  }
+
+  h2 {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 600;
+  }
+
+  .desc {
+    margin-top: 12px;
+    font-size: 13px;
+    line-height: 1.55;
+    opacity: 0.9;
+  }
+
+  .note {
+    font-size: 12px;
+    opacity: 0.8;
+    margin-top: 10px;
+  }
+
+  .actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 12px;
+    margin-top: 22px;
+  }
+
+  button {
+    padding: 8px 16px;
+    font-size: 13px;
+    border-radius: 8px;
+    border: none;
+    cursor: pointer;
+  }
+
+  .secondary {
+    background: transparent;
+    border: 1px solid var(--vscode-editorGroup-border);
+    color: var(--vscode-editor-foreground);
+  }
+
+  .primary {
+    background: #0e639c;
+    color: white;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.45);
+  }
+</style>
+</head>
+
+<body>
+  <div class="card">
+    <h2>🔒 Project Not Protected</h2>
+
+    <div class="desc">
+      This project is currently not protected by Shielder.
+    </div>
+
+    <div class="note">
+      To manage secrets, the project must be protected first.
+    </div>
+
+    <div class="actions">
+       <button class="secondary" onclick="cancel()">Cancel</button>
+      <button class="danger" onclick="revert()">Protect Now</button>
+    </div>
+  </div>
+
+<script>
+  const vscode = acquireVsCodeApi();
+
+  function cancel() {
+    vscode.postMessage({ type: "cancel" });
+  }
+
+  function protect() {
+    vscode.postMessage({ type: "protect" });
+  }
+</script>
+</body>
+</html>`;
+}
 
 function deactivate() { }
 
