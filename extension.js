@@ -22,12 +22,24 @@ const SECRET_FILE = ".ai-secret-guard.json";
  * REGEX RULES
  *********************************/
 const EMAIL_REGEX = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
-const PHONE_REGEX = /^\d{5,15}$/;
+const PHONE_REGEX = /^\+?\d[\d\s-]{7,14}\d$/;
 const API_KEY_REGEX = /^(sk_live_|sk_test_|AIzaSy)[A-Za-z0-9_-]+$/;
 
 const STRING_ASSIGN_REGEX =
   /\b(const|let|var)\s+([A-Za-z0-9_]+)\s*=\s*["'`]([^"'`]+)["'`]/g;
 
+const STRING_LITERAL_REGEX = /["'`]([^"'`\n]+)["'`]/g;
+
+const HARD_EXCLUDED_FILES = new Set([
+  "package.json",
+  "package-lock.json",
+  "yarn.lock",
+  "pnpm-lock.yaml",
+  "composer.json",
+  "podfile.lock",
+  "Podfile.lock",
+  "Info.plist" // optional: iOS metadata
+]);
 
 
   const internalFsOps = new Set();
@@ -41,11 +53,41 @@ const SHIELDER_INTERNAL_FILES = new Set([
  * FINGERPRINT (DAY 9.3)
  *********************************/
 
-function shouldSkipScanFile(uri) {
-  const fileName = uri.fsPath.split("/").pop();
-  return SHIELDER_INTERNAL_FILES.has(fileName);
+
+function isLikelyKey(value) {
+  if (!value) return false;
+
+  // minimum length you want to support
+  if (value.length < 7) return false;
+
+  // ❌ Clearly human-readable → skip
+  if (/^[a-zA-Z\s]+$/.test(value)) return false;       // plain words
+  if (/^[A-Z_]+$/.test(value)) return false;           // APP_START
+  if (/^[a-z]+(-[a-z]+)+$/.test(value)) return false;  // kebab-case
+  if (/^[a-zA-Z_]+$/.test(value)) return false;        // identifiers
+  if (/^[\p{Emoji}\s:]+$/u.test(value)) return false; // emoji / log text
+
+  // ✅ Everything else is considered a key
+  return true;
 }
 
+
+
+function shouldSkipScanFile(uri) {
+  const fileName = uri.fsPath.split("/").pop();
+
+  // 🚫 Skip Shielder internal files
+  if (SHIELDER_INTERNAL_FILES.has(fileName)) {
+    return true;
+  }
+
+  // 🚫 Skip hard-excluded project metadata files
+  if (HARD_EXCLUDED_FILES.has(fileName)) {
+    return true;
+  }
+
+  return false;
+}
 
 
 async function generateProjectFingerprint(workspaceFolder) {
@@ -203,29 +245,95 @@ async function loadSecretFile(workspaceFolder) {
   }
 }
 
+function isIgnoredContext(line) {
+  if (!line) return true;
+
+  const trimmed = line.trim();
+
+  return (
+    // 🔕 Console / logs
+    trimmed.includes("console.log") ||
+    trimmed.includes("console.error") ||
+    trimmed.includes("console.warn") ||
+
+    // 🔕 Alerts
+    trimmed.includes("alert(") ||
+
+    // 🔕 React / RN UI
+    trimmed.includes("<Text") ||
+    trimmed.includes("Text>") ||
+
+    // 🚫 IMPORT / EXPORT / REQUIRE (CRITICAL FIX)
+    trimmed.startsWith("import ") ||
+    trimmed.startsWith("export ") ||
+    trimmed.includes(" from ") ||
+    trimmed.startsWith("require(")
+  );
+}
+
+
+
 /*********************************
  * DETECTION
  *********************************/
-function detect(text) {
+function detect(line) {
+  if (isIgnoredContext(line)) {
+  return [];
+}
+
+  STRING_ASSIGN_REGEX.lastIndex = 0;
+  STRING_LITERAL_REGEX.lastIndex = 0;
+
   const found = [];
+  const seen = new Set();
   let m;
 
-  while ((m = STRING_ASSIGN_REGEX.exec(text))) {
+  // ─────────────────────────
+  // 1️⃣ ASSIGNMENT DETECTION
+  // ─────────────────────────
+  while ((m = STRING_ASSIGN_REGEX.exec(line))) {
     const variable = m[2];
     const value = m[3];
 
-    if (value.length < 5) continue;
-
-    let type = "policy";
+    let type = null;
     if (EMAIL_REGEX.test(value)) type = "email";
     else if (PHONE_REGEX.test(value)) type = "phone";
     else if (API_KEY_REGEX.test(value)) type = "apiKey";
+    else if (isLikelyKey(value)) type = "genericKey";
+    else continue;
 
     found.push({ value, type, variable });
+    seen.add(value);
+  }
+
+  // ─────────────────────────
+  // 2️⃣ ARGUMENT / INLINE STRINGS
+  // ─────────────────────────
+  while ((m = STRING_LITERAL_REGEX.exec(line))) {
+    const value = m[1];
+
+    if (seen.has(value)) continue;
+    if (value === "NOT_DECRYPTED_YET") continue;
+
+    let type = null;
+    if (EMAIL_REGEX.test(value)) type = "email";
+    else if (PHONE_REGEX.test(value)) type = "phone";
+    else if (API_KEY_REGEX.test(value)) type = "apiKey";
+    else if (isLikelyKey(value)) type = "genericKey";
+    else continue;
+
+    found.push({
+      value,
+      type,
+      variable: null // argument / inline
+    });
+
+    seen.add(value);
   }
 
   return found;
 }
+
 
 
 /*********************************
@@ -406,149 +514,163 @@ context.subscriptions.push(
 
 
   /* -------- SCAN PROJECT -------- */
-  context.subscriptions.push(
-    vscode.commands.registerCommand("shielder.scan", async () => {
-       await context.workspaceState.update("shielder.reverted", false);
-      const ws = vscode.workspace.workspaceFolders?.[0];
-      if (!ws) {
-        vscode.window.showWarningMessage(
-          "⚠️ No workspace folder open. Open a project to scan."
+ context.subscriptions.push(
+  vscode.commands.registerCommand("shielder.scan", async () => {
+    await context.workspaceState.update("shielder.reverted", false);
+
+    const ws = vscode.workspace.workspaceFolders?.[0];
+    if (!ws) {
+      vscode.window.showWarningMessage(
+        "⚠️ No workspace folder open. Open a project to scan."
+      );
+      return;
+    }
+
+    vscode.window.showInformationMessage("🔍 Scanning project for secrets…");
+
+    await ensureProjectKey(ws);
+    const store = await loadSecretFile(ws);
+    const key = await getProjectKey(ws);
+
+    const files = await vscode.workspace.findFiles(
+      "**/*.{js,ts,jsx,tsx}",
+      "**/node_modules/**"
+    );
+
+    let updatedFiles = 0;
+    let detectedAny = false;
+
+    for (const file of files) {
+      if (shouldSkipScanFile(file)) continue;
+
+      try {
+        const text = (await vscode.workspace.fs.readFile(file)).toString();
+        const lines = text.split("\n");
+
+        // ─────────────────────────────
+        // FILE-LEVEL GATE (LINE-BASED)
+        // ─────────────────────────────
+        const fileHasSecrets = lines.some(line => detect(line).length > 0);
+        if (!fileHasSecrets) continue;
+
+        let updated = text;
+
+        // ─────────────────────────────
+        // Ensure resolveSecret import
+        // ─────────────────────────────
+        const hasResolverImport = lines.some(
+          l =>
+            l.includes('import { resolveSecret }') &&
+            l.includes('@shielder/runtime')
         );
-        return;
-      }
 
-      vscode.window.showInformationMessage(
-        "🔍 Scanning project for secrets…"
-      );
-
-      await ensureProjectKey(ws);
-      const store = await loadSecretFile(ws);
-      const key = await getProjectKey(ws);
-
-      const files = await vscode.workspace.findFiles(
-        "**/*",
-        "**/node_modules/**"
-      );
-
-      let updatedFiles = 0;
-      let detectedAny = false;
-
-      for (const file of files) {
-        if (shouldSkipScanFile(file)) continue;
-        try {
-          const text = (await vscode.workspace.fs.readFile(file)).toString();
-          let updated = text;
-
-          const lines = updated.split("\n");
-          let hasResolverImport = lines.some(
-            l =>
-              l.includes('resolveSecret(') &&
-              l.includes('@shielder/runtime')
-          );
-
-          // If resolveSecret is used but import is missing → inject it
-          const usesResolver = lines.some(l => l.includes("resolveSecret("));
-
-          if (usesResolver && !hasResolverImport) {
-            let insertAt = 0;
-
-            // Place import after existing imports
-            while (
-              insertAt < lines.length &&
-              (lines[insertAt].startsWith("import ") ||
-                lines[insertAt].startsWith("require("))
-            ) {
-              insertAt++;
-            }
-
-            lines.splice(
-              insertAt,
-              0,
-              'import { resolveSecret } from "@shielder/runtime";'
-            );
+        if (!hasResolverImport) {
+          let insertAt = 0;
+          while (
+            insertAt < lines.length &&
+            (lines[insertAt].startsWith("import ") ||
+              lines[insertAt].startsWith("require("))
+          ) {
+            insertAt++;
           }
 
+          lines.splice(
+            insertAt,
+            0,
+            'import { resolveSecret } from "@shielder/runtime";'
+          );
+        }
 
-          for (let i = 0; i < lines.length; i++) {
-            const found = detect(lines[i]);
-            if (!found.length) continue;
+        // ─────────────────────────────
+        // LINE-BY-LINE REPLACEMENT
+        // ─────────────────────────────
+        for (let i = 0; i < lines.length; i++) {
+          const found = detect(lines[i]);
+          if (!found.length) continue;
 
-            for (const s of found) {
-              detectedAny = true;
-              const hash = hashValue(s.value);
+          for (const s of found) {
+            detectedAny = true;
+            const hash = hashValue(s.value);
 
-              if (store.data.secrets.some(e => e.hash === hash)) {
-                continue;
-              }
+            // 🔥 IMPORTANT FIX:
+            // If secret already exists → STILL replace in this file
+            const existing = store.data.secrets.find(e => e.hash === hash);
 
-              const id = crypto.randomBytes(4).toString("hex");
-              const placeholder = `<SECRET_${id.toUpperCase()}>`;
-
-              // Encrypt (BLACK BOX)
-              const encrypted = encryptWithKey(key, s.value);
-
-              // Replace only THIS LINE
-              // lines[i] = lines[i].replace(s.value, placeholder);
-              // Replace value with runtime resolver
+            if (existing) {
               if (!lines[i].includes("resolveSecret(")) {
                 lines[i] = lines[i]
                   .replace(
                     `"${s.value}"`,
-                    `resolveSecret("${placeholder}")`
+                    `resolveSecret("${existing.placeholder}")`
                   )
                   .replace(
                     `'${s.value}'`,
-                    `resolveSecret("${placeholder}")`
+                    `resolveSecret("${existing.placeholder}")`
                   );
               }
-
-
-
-              // ✅ STORE FULL METADATA
-              store.data.secrets.push({
-                id,
-                type: s.type,
-                hash,
-                file: path.relative(ws.uri.fsPath, file.fsPath),
-                line: i + 1,
-                placeholder,
-                variable: s.variable,
-                encrypted,
-                // lastValue: s.value,
-                disabled: false
-              });
+              continue;
             }
+
+            // New secret
+            const id = crypto.randomBytes(4).toString("hex");
+            const placeholder = `<SECRET_${id.toUpperCase()}>`;
+            const encrypted = encryptWithKey(key, s.value);
+
+            if (!lines[i].includes("resolveSecret(")) {
+              lines[i] = lines[i]
+                .replace(
+                  `"${s.value}"`,
+                  `resolveSecret("${placeholder}")`
+                )
+                .replace(
+                  `'${s.value}'`,
+                  `resolveSecret("${placeholder}")`
+                );
+            }
+
+            store.data.secrets.push({
+              id,
+              type: s.type,
+              hash,
+              file: path.relative(ws.uri.fsPath, file.fsPath),
+              line: i + 1,
+              placeholder,
+              variable: s.variable,
+              encrypted,
+              disabled: false
+            });
           }
-
-          updated = lines.join("\n");
-
-
-          if (updated !== text) {
-            await vscode.workspace.fs.writeFile(file, Buffer.from(updated));
-            updatedFiles++;
-          }
-        } catch {
-          vscode.window.showWarningMessage(
-            `❌ Failed to read file: ${path.basename(file.fsPath)}`
-          );
         }
+
+        updated = lines.join("\n");
+
+        if (updated !== text) {
+          await vscode.workspace.fs.writeFile(file, Buffer.from(updated));
+          updatedFiles++;
+        }
+      } catch (err) {
+        vscode.window.showWarningMessage(
+          `❌ Failed to read file: ${path.basename(file.fsPath)}`
+        );
       }
+    }
 
-      if (!detectedAny) {
-        vscode.window.showInformationMessage("ℹ️ No secrets detected");
-        return;
-      }
+    if (!detectedAny) {
+      vscode.window.showInformationMessage("ℹ️ No secrets detected");
+      return;
+    }
 
-      await vscode.workspace.fs.writeFile(
-        store.uri,
-        Buffer.from(JSON.stringify(store.data, null, 2))
-      );
+    await vscode.workspace.fs.writeFile(
+      store.uri,
+      Buffer.from(JSON.stringify(store.data, null, 2))
+    );
 
-      vscode.window.showInformationMessage(
-        `🔐 Secrets protected: ${updatedFiles} files updated`
-      );
-    })
-  );
+    vscode.window.showInformationMessage(
+      `🔐 Secrets protected: ${updatedFiles} files updated`
+    );
+  })
+);
+
 
   /* -------- ROTATE PROJECT KEY (9.4.2) -------- */
   context.subscriptions.push(
