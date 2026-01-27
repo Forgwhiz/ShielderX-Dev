@@ -7,10 +7,6 @@
  * - Temporary in-memory decrypt is allowed ONLY for key rotation.
  *********************************/
 
-
-
-
-
 const vscode = require("vscode");
 const path = require("path");
 const crypto = require("crypto");
@@ -2177,7 +2173,7 @@ function getNotProtectedHTML() {
 
     <div class="actions">
        <button class="secondary" onclick="cancel()">Cancel</button>
-      <button class="danger" onclick="revert()">Protect Now</button>
+      <button class="danger" onclick="protect()">Protect Now</button>
     </div>
   </div>
 
