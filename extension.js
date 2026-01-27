@@ -30,6 +30,13 @@ const STRING_ASSIGN_REGEX =
 
 const STRING_LITERAL_REGEX = /["'`]([^"'`\n]+)["'`]/g;
 
+const SHIELDER_PROTECT_CALL_REGEX =
+  /ShielderX\.protect\(\s*["'`]([^"'`]+)["'`]\s*\)/g;
+
+
+  const RESOLVE_SECRET_REGEX =
+  /resolveSecret\(\s*["'`]<SECRET_[A-Z0-9]+>["'`]\s*\)/;
+
 const HARD_EXCLUDED_FILES = new Set([
   "package.json",
   "package-lock.json",
@@ -52,6 +59,33 @@ const SHIELDER_INTERNAL_FILES = new Set([
 /*********************************
  * FINGERPRINT (DAY 9.3)
  *********************************/
+
+function findResolveSecretRange(document, position) {
+  const line = document.lineAt(position.line);
+  const text = line.text;
+
+  const regex =
+    /resolveSecret\(\s*["'`]<SECRET_[A-Z0-9]+>["'`]\s*\)/g;
+
+  let match;
+  while ((match = regex.exec(text))) {
+    const start = match.index;
+    const end = start + match[0].length;
+
+    if (
+      position.character >= start &&
+      position.character <= end
+    ) {
+      return new vscode.Range(
+        position.line,
+        start,
+        position.line,
+        end
+      );
+    }
+  }
+  return null;
+}
 
 
 function isLikelyKey(value) {
@@ -246,7 +280,7 @@ async function loadSecretFile(workspaceFolder) {
 }
 
 function isIgnoredContext(line) {
-  if (!line) return true;
+  if (!line || !line.trim()) return false;
 
   const trimmed = line.trim();
 
@@ -263,13 +297,14 @@ function isIgnoredContext(line) {
     trimmed.includes("<Text") ||
     trimmed.includes("Text>") ||
 
-    // 🚫 IMPORT / EXPORT / REQUIRE (CRITICAL FIX)
+    // 🚫 IMPORT / EXPORT / REQUIRE
     trimmed.startsWith("import ") ||
     trimmed.startsWith("export ") ||
     trimmed.includes(" from ") ||
     trimmed.startsWith("require(")
   );
 }
+
 
 
 
@@ -434,10 +469,199 @@ async function loadExistingSecretFile(ws) {
 }
 
 
+async function handleShielderProtectCall(editor, lineNumber, lineText) {
+    SHIELDER_PROTECT_CALL_REGEX.lastIndex = 0;
+ if (!lineText.includes("ShielderX.protect(")) return;
+  if (!lineText.includes(")")) return;
+  let match;
+  while ((match = SHIELDER_PROTECT_CALL_REGEX.exec(lineText))) {
+    const fullCall = match[0];
+    const value = match[1];
+
+    // 🚫 Prevent double handling
+    if (lineText.includes("resolveSecret(")) return;
+
+    const confirm = await vscode.window.showWarningMessage(
+      `🔐 Protect this value?\n\n"${value}"`,
+      { modal: true },
+      "Protect"
+    );
+
+    if (confirm !== "Protect") return;
+
+    const ws = vscode.workspace.workspaceFolders?.[0];
+    if (!ws) return;
+
+    await ensureProjectKey(ws);
+    const store = await loadSecretFile(ws);
+    const key = await getProjectKey(ws);
+
+    const id = crypto.randomBytes(4).toString("hex");
+    const placeholder = `<SECRET_${id.toUpperCase()}>`;
+    const encrypted = encryptWithKey(key, value);
+
+    await editor.edit(edit => {
+      edit.replace(
+        new vscode.Range(
+          lineNumber,
+          lineText.indexOf(fullCall),
+          lineNumber,
+          lineText.indexOf(fullCall) + fullCall.length
+        ),
+        `resolveSecret("${placeholder}")`
+      );
+    });
+
+    store.data.secrets.push({
+      id,
+      type: "inline-protect",
+      hash: hashValue(value),
+      file: path.relative(
+        ws.uri.fsPath,
+        editor.document.uri.fsPath
+      ),
+      line: lineNumber + 1,
+      placeholder,
+      variable: null,
+      encrypted,
+      disabled: false
+    });
+
+    await vscode.workspace.fs.writeFile(
+      store.uri,
+      Buffer.from(JSON.stringify(store.data, null, 2))
+    );
+
+    vscode.window.showInformationMessage(
+      "🔐 Value protected successfully."
+    );
+  }
+}
+
+function findStringLiteralRange(document, position) {
+  const line = document.lineAt(position.line);
+  const text = line.text;
+
+  const regex = /(["'`])([^"'`]+)\1/g;
+  let match;
+
+  while ((match = regex.exec(text))) {
+    const start = match.index;
+    const end = start + match[0].length;
+
+    if (
+      position.character >= start &&
+      position.character <= end
+    ) {
+      return {
+        range: new vscode.Range(
+          position.line,
+          start,
+          position.line,
+          end
+        ),
+        value: match[2] // without quotes
+      };
+    }
+  }
+
+  return null;
+}
+
+
+function isSecretPlaceholder(value) {
+  return /^<SECRET_[A-Z0-9]+>$/.test(value);
+}
+
+function isWrappedStringLiteral(text) {
+  if (!text || text.length < 2) return false;
+
+  const first = text[0];
+  const last = text[text.length - 1];
+
+  if (first !== last) return false;
+  if (!['"', "'", '`'].includes(first)) return false;
+
+  // ensure last quote is not escaped
+  let backslashes = 0;
+  for (let i = text.length - 2; i >= 0 && text[i] === '\\'; i--) {
+    backslashes++;
+  }
+  return backslashes % 2 === 0;
+}
+
+
+
 function activate(context) {
 setupProtectionWatchers(context);
   // also run once on activation
   handleWorkspaceOpen(context);
+
+
+
+  context.subscriptions.push(
+  vscode.commands.registerCommand(
+    "shielder.revertSelectionInline",
+    async (uri, range) => {
+      const ws = vscode.workspace.workspaceFolders?.[0];
+      if (!ws) return;
+
+      const editor = await vscode.window.showTextDocument(uri);
+      const lineText = editor.document.lineAt(range.start.line).text;
+
+      // 🔍 Extract placeholder
+      const match = lineText.match(/<SECRET_[A-Z0-9]+>/);
+      if (!match) {
+        vscode.window.showWarningMessage(
+          "No protected secret found at cursor."
+        );
+        return;
+      }
+
+      const placeholder = match[0];
+
+      const store = await loadSecretFile(ws);
+      const key = await getProjectKey(ws);
+
+      const secret = store.data.secrets.find(
+        s => s.placeholder === placeholder && !s.disabled
+      );
+
+      if (!secret) {
+        vscode.window.showWarningMessage(
+          "Secret not found in store."
+        );
+        return;
+      }
+
+      const confirm = await vscode.window.showWarningMessage(
+        "🔓 Revert this protected value back to plaintext?",
+        { modal: true },
+        "Revert"
+      );
+
+      if (confirm !== "Revert") return;
+
+      const plaintext = decryptWithKey(key, secret.encrypted);
+
+      await editor.edit(edit => {
+        edit.replace(range, `"${plaintext}"`);
+      });
+
+      // Mark as disabled (do NOT delete history)
+      secret.disabled = true;
+
+      await vscode.workspace.fs.writeFile(
+        store.uri,
+        Buffer.from(JSON.stringify(store.data, null, 2))
+      );
+
+      vscode.window.showInformationMessage(
+        "🔓 Value reverted successfully."
+      );
+    }
+  )
+);
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeWorkspaceFolders(async () => {
@@ -446,10 +670,206 @@ setupProtectionWatchers(context);
   );
 
 
+context.subscriptions.push(
+  vscode.workspace.onDidChangeTextDocument(async event => {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) return;
+    if (event.document !== editor.document) return;
+
+    for (const change of event.contentChanges) {
+      // 🔕 Ignore normal typing
+      const text = change.text;
+      const isCompletion =
+        text.includes("\n") || text.includes(";");
+
+      if (!isCompletion) continue;
+
+      const lineNumber =
+        text.includes("\n")
+          ? change.range.start.line
+          : change.range.end.line;
+
+      const lineText =
+        editor.document.lineAt(lineNumber).text;
+
+      await handleShielderProtectCall(
+        editor,
+        lineNumber,
+        lineText
+      );
+    }
+  })
+);
+
+
+
+
   // ─────────────────────────────
 // BLOCK MANAGED FILES ON OPEN
 // ─────────────────────────────
 // Block managed files on open / focus
+
+context.subscriptions.push(
+  vscode.languages.registerCodeActionsProvider(
+    ["javascript", "typescript", "javascriptreact", "typescriptreact", "json"],
+    {
+provideCodeActions(document, range) {
+  const actions = [];
+  const position = range.start;
+  const lineText = document.lineAt(position.line).text;
+
+  // ─────────────────────────────
+  // 🔓 REVERT (cursor OR selection)
+  // ─────────────────────────────
+  const secretRange = findResolveSecretRange(document, position);
+  if (secretRange) {
+    const revertAction = new vscode.CodeAction(
+      "🔓 Revert protected value",
+      vscode.CodeActionKind.QuickFix
+    );
+
+    revertAction.command = {
+      command: "shielder.revertSelectionInline",
+      title: "Revert protected value",
+      arguments: [document.uri, secretRange]
+    };
+
+    actions.push(revertAction);
+  }
+
+  // ─────────────────────────────
+  // 🔐 PROTECT (selection OR cursor)
+  // ─────────────────────────────
+  let protectRange = null;
+  let protectValue = null;
+
+  // 1️⃣ Selection-based
+  if (!range.isEmpty) {
+    protectRange = range;
+    protectValue = document.getText(range).trim();
+  } 
+  // 2️⃣ Cursor-based
+  else {
+    const found = findStringLiteralRange(document, position);
+    if (found) {
+      protectRange = found.range;
+      protectValue = found.value;
+    }
+  }
+
+  if (protectRange && protectValue && protectValue.length >= 4) {
+    // Ignore noisy contexts
+    if (!isIgnoredContext(lineText) && !protectValue.includes("resolveSecret(")) {
+
+       if (isSecretPlaceholder(protectValue)) {
+    return actions.length ? actions : undefined;
+  }
+
+   if (isIgnoredContext(lineText)) {
+    return actions.length ? actions : undefined;
+  }
+
+  // 🚫 Already inside resolveSecret
+  if (lineText.includes("resolveSecret(")) {
+    return actions.length ? actions : undefined;
+  }
+
+      const protectAction = new vscode.CodeAction(
+        "🔐 Protect with Shielder",
+        vscode.CodeActionKind.QuickFix
+      );
+
+      protectAction.command = {
+        command: "shielder.protectSelectionInline",
+        title: "Protect with Shielder",
+        arguments: [
+          document.uri,
+          protectRange,
+          protectValue
+        ]
+      };
+
+      actions.push(protectAction);
+    }
+  }
+
+  return actions.length ? actions : undefined;
+}
+
+
+    },
+    {
+      providedCodeActionKinds: [vscode.CodeActionKind.QuickFix]
+    }
+  )
+);
+
+
+context.subscriptions.push(
+  vscode.commands.registerCommand(
+    "shielder.protectSelectionInline",
+    async (uri, range, value) => {
+      const ws = vscode.workspace.workspaceFolders?.[0];
+      if (!ws) return;
+
+      await ensureProjectKey(ws);
+      const store = await loadSecretFile(ws);
+      const key = await getProjectKey(ws);
+
+      const editor = await vscode.window.showTextDocument(uri);
+
+      const id = crypto.randomBytes(4).toString("hex");
+      const placeholder = `<SECRET_${id.toUpperCase()}>`;
+      const encrypted = encryptWithKey(key, value);
+
+     // 🔁 Normalize replacement range to full string literal
+let finalRange = range;
+let finalValue = value;
+
+// If selection does NOT wrap a full string literal,
+// expand to the full string literal at cursor
+if (!isWrappedStringLiteral(value)) {
+  const found = findStringLiteralRange(
+    editor.document,
+    range.start
+  );
+  if (found) {
+    finalRange = found.range;
+    finalValue = found.value;
+  }
+}
+
+await editor.edit(edit => {
+  edit.replace(
+    finalRange,
+    `resolveSecret("${placeholder}")`
+  );
+});
+
+
+      store.data.secrets.push({
+        id,
+        type: "manual",
+        hash: hashValue(value),
+        file: path.relative(ws.uri.fsPath, uri.fsPath),
+        line: range.start.line + 1,
+        placeholder,
+        variable: null,
+        encrypted,
+        disabled: false
+      });
+
+      await vscode.workspace.fs.writeFile(
+        store.uri,
+        Buffer.from(JSON.stringify(store.data, null, 2))
+      );
+
+      vscode.window.showInformationMessage("🔐 Value protected.");
+    }
+  )
+);
+
+
 context.subscriptions.push(
   vscode.workspace.onDidOpenTextDocument(doc => {
     const editor = vscode.window.visibleTextEditors.find(
