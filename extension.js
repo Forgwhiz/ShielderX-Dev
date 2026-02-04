@@ -2147,6 +2147,8 @@ function openOnOpenWarning(ws) {
 
 }
 
+
+
 function getOnOpenWarningHTML() {
   return `
 <!DOCTYPE html>
@@ -2167,6 +2169,46 @@ function getOnOpenWarningHTML() {
     display: flex;
     align-items: center;
     justify-content: center;
+  }
+
+  .action-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .info-icon {
+    cursor: pointer;
+    font-size: 13px;
+    color: #9da5b4;
+    border: 1px solid #3c3c3c;
+    border-radius: 50%;
+    width: 16px;
+    height: 16px;
+    line-height: 14px;
+    text-align: center;
+  }
+
+  .info-icon:hover {
+    color: #ffffff;
+    background: #3c3c3c;
+  }
+
+  .tooltip {
+    position: absolute;
+    max-width: 320px;
+    background: #1e1e1e;
+    color: #d4d4d4;
+    border: 1px solid #3c3c3c;
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-size: 12px;
+    z-index: 1000;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  }
+
+  .hidden {
+    display: none;
   }
 
   .card {
@@ -2249,6 +2291,12 @@ function getOnOpenWarningHTML() {
     gap: 12px;
   }
 
+  .danger {
+    background: #d16969;
+    color: white;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.45);
+  }
+
   button {
     padding: 9px 18px;
     font-size: 13px;
@@ -2269,12 +2317,6 @@ function getOnOpenWarningHTML() {
     opacity: 0.85;
   }
 
-  .primary-outline {
-    background: rgba(255,255,255,0.06);
-    color: var(--vscode-editor-foreground);
-    border: 1px solid var(--vscode-editorGroup-border);
-  }
-
   .primary {
     background: var(--vscode-button-background);
     color: var(--vscode-button-foreground);
@@ -2288,7 +2330,7 @@ function getOnOpenWarningHTML() {
     <div class="header">
       <div class="icon">🔐</div>
       <div>
-        <h2>Shielder AI Warning</h2>
+        <h2>ShielderX Warning</h2>
         <div class="subtle">Proactive protection before AI tools access code</div>
       </div>
     </div>
@@ -2308,29 +2350,88 @@ function getOnOpenWarningHTML() {
     <div class="divider"></div>
 
     <div class="actions">
-      <button class="secondary" onclick="ignore()">Ignore</button>
-      <button class="primary-outline" onclick="protectAlways()">
-        Protect & Always Enable
-      </button>
-      <button class="primary" onclick="protect()">Protect Now</button>
+      <div class="action-group">
+        <button class="primary" onclick="protectDefault()">
+          Protect (Project Key)
+        </button>
+        <span class="info-icon" data-info="project-key">ⓘ</span>
+      </div>
+
+      <div class="action-group">
+        <button class="danger" onclick="protectMachine()">
+          Protect (Machine Key)
+        </button>
+        <span class="info-icon" data-info="machine-key">ⓘ</span>
+      </div>
+
     </div>
+
+    <div id="info-tooltip" class="tooltip hidden"></div>
   </div>
 
 <script>
   const vscode = acquireVsCodeApi();
-  function protect() {
-    vscode.postMessage({ type: "protect" });
-  }
-  function protectAlways() {
-    vscode.postMessage({ type: "protect-always" });
-  }
+
   function ignore() {
     vscode.postMessage({ type: "ignore" });
   }
+
+  function protectDefault() {
+    vscode.postMessage({ type: "protect-default" });
+  }
+
+  function protectMachine() {
+    vscode.postMessage({ type: "protect-machine" });
+  }
+
+  // ─────────────────────────────
+  // INFO TOOLTIP LOGIC (ADDED)
+  // ─────────────────────────────
+  const tooltip = document.getElementById("info-tooltip");
+
+
+   const INFO_TEXT = {
+    "project-key":
+      "<b>Project Key</b><br><br>" +
+      "• A shared key is saved in the project<br>" +
+      "• Team members can decrypt automatically after pull<br>" +
+      "• Best for shared repositories<br><br>" +
+      "⚠️ Losing the key means secrets cannot be recovered",
+
+    "machine-key":
+      "<b>Machine Key</b><br><br>" +
+      "• Key is stored only on this machine<br>" +
+      "• Nothing is committed to Git<br>" +
+      "• Each developer initializes locally<br><br>" +
+      "🔒 Most secure option for AI protection"
+  };
+
+  document.querySelectorAll(".info-icon").forEach(icon => {
+    icon.addEventListener("click", e => {
+      e.stopPropagation();
+      const key = icon.dataset.info;
+      tooltip.innerHTML = INFO_TEXT[key];
+
+      const rect = icon.getBoundingClientRect();
+      tooltip.style.top = rect.bottom + 6 + "px";
+      tooltip.style.left = rect.left + "px";
+
+      tooltip.classList.remove("hidden");
+    });
+  });
+
+  document.addEventListener("click", () => {
+    tooltip.classList.add("hidden");
+  });
+
+ 
+
 </script>
 </body>
 </html>`;
 }
+
+
 
 /*
 
