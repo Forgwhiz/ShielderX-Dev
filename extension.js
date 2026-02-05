@@ -11,6 +11,8 @@ const vscode = require("vscode");
 const path = require("path");
 const crypto = require("crypto");
 
+let shielderStatusBar;
+
 /*********************************
  * CONSTANTS
  *********************************/
@@ -254,7 +256,8 @@ function hashValue(v) {
 /*********************************
  * SECRET STORE
  *********************************/
-async function loadSecretFile(workspaceFolder) {
+// Replace the old loadSecretFile with this new version
+async function loadSecretFile(workspaceFolder, options = { createIfMissing: true }) {
   const uri = vscode.Uri.joinPath(workspaceFolder.uri, SECRET_FILE);
 
   try {
@@ -263,9 +266,14 @@ async function loadSecretFile(workspaceFolder) {
     );
     return { uri, data };
   } catch {
+    if (!options.createIfMissing) {
+      return null; // IMPORTANT: no auto-create
+    }
+
     const fingerprint = await generateProjectFingerprint(workspaceFolder);
     const fresh = {
       version: 2,
+      mode: null,
       fingerprint,
       secrets: []
     };
@@ -278,6 +286,116 @@ async function loadSecretFile(workspaceFolder) {
     return { uri, data: fresh };
   }
 }
+
+// --- MACHINE KEY (OS SECURE) ---
+// async function getMachineKey(context) {
+//   return await context.secrets.get("shielder.machineKey");
+// }
+
+async function setMachineKey(extensionContext, key) {
+  await extensionContext.secrets.store("shielder.machineKey", key);
+}
+
+// async function deleteMachineKey(context) {
+//   await context.secrets.delete("shielder.machineKey");
+// }
+
+
+// --- helper: read protection mode (workspace config > package.json > null) ---
+async function getProtectionMode(ws) {
+  const store = await loadSecretFile(ws, { createIfMissing: false });
+  if (!store) return null;
+
+  return store.data.mode ?? null;
+}
+
+
+// --- helper: quick check whether @shielder/runtime is listed in package.json ---
+async function isRuntimeInstalled(ws) {
+  try {
+    const pkgUri = vscode.Uri.joinPath(ws.uri, "package.json");
+    const pkgText = (await vscode.workspace.fs.readFile(pkgUri)).toString();
+    const pkg = JSON.parse(pkgText);
+    const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+    return !!deps["@shielder/runtime"];
+  } catch {
+    return false;
+  }
+}
+
+// --- helper: UI to prompt user to install runtime (very small webview) ---
+function openInstallRuntimeWebview(ws) {
+  const panel = vscode.window.createWebviewPanel(
+    "shielderInstallRuntime",
+    "Shielder — Install Runtime",
+    vscode.ViewColumn.Active,
+    { enableScripts: true }
+  );
+
+  panel.webview.html = `
+  <!doctype html>
+  <html>
+    <body style="font-family: system-ui, -apple-system; padding:20px;">
+      <h2>Install @shielder/runtime</h2>
+      <p>This project doesn't include <code>@shielder/runtime</code>. To enable runtime resolution (resolveSecret) install the package and try again.</p>
+      <p>Run <code>npm install @shielder/runtime</code> or add it to your project dependencies.</p>
+      <div style="margin-top:18px;">
+        <button onclick="install()">I installed it</button>
+        <button onclick="close()">Close</button>
+      </div>
+      <script>
+        const vscode = acquireVsCodeApi();
+        function install(){ vscode.postMessage({ type: 'installed' }); }
+        function close(){ vscode.postMessage({ type: 'close' }); }
+      </script>
+    </body>
+  </html>`;
+
+  panel.webview.onDidReceiveMessage(msg => {
+    if (msg.type === "installed") {
+      panel.dispose();
+      // no automatic scan — user will be prompted by warning view next
+    }
+    if (msg.type === "close") {
+      panel.dispose();
+    }
+  });
+}
+
+// --- helper: UI to prompt and generate machine key (requires context) ---
+function openGenerateMachineKey(extensionContext) {
+  const panel = vscode.window.createWebviewPanel(
+    "shielderMachineKey",
+    "Generate Machine Key",
+    vscode.ViewColumn.Active,
+    { enableScripts: true }
+  );
+
+  panel.webview.html = `
+  <html>
+    <body style="font-family: system-ui; padding:20px">
+      <h2>Machine Key Required</h2>
+      <p>This project uses <b>machine-based protection</b>.</p>
+      <p>A local encrypted key is required to decrypt secrets.</p>
+      <button onclick="gen()">Generate Key</button>
+      <script>
+        const vscode = acquireVsCodeApi();
+        function gen() { vscode.postMessage({ type: "gen" }); }
+      </script>
+    </body>
+  </html>`;
+
+  panel.webview.onDidReceiveMessage(async msg => {
+    if (msg.type === "gen") {
+      const key = crypto.randomBytes(32).toString("hex");
+      await setMachineKey(extensionContext, key);
+      vscode.window.showInformationMessage("🔐 Machine key generated securely.");
+      panel.dispose();
+    }
+  });
+}
+
+
 
 function isIgnoredContext(line) {
   if (!line || !line.trim()) return false;
@@ -306,15 +424,16 @@ function isIgnoredContext(line) {
 }
 
 
-
-
 /*********************************
  * DETECTION
  *********************************/
 function detect(line) {
-  if (isIgnoredContext(line)) {
-  return [];
-}
+  if (!line || !line.trim()) return [];
+
+  // 🚫 NEVER scan protected lines
+  if (line.includes("resolveSecret(")) return [];
+
+  if (isIgnoredContext(line)) return [];
 
   STRING_ASSIGN_REGEX.lastIndex = 0;
   STRING_LITERAL_REGEX.lastIndex = 0;
@@ -324,11 +443,14 @@ function detect(line) {
   let m;
 
   // ─────────────────────────
-  // 1️⃣ ASSIGNMENT DETECTION
+  // 1️⃣ ASSIGNMENTS
   // ─────────────────────────
   while ((m = STRING_ASSIGN_REGEX.exec(line))) {
     const variable = m[2];
     const value = m[3];
+
+    // 🚫 Skip placeholders
+    if (isSecretPlaceholderValue(value)) continue;
 
     let type = null;
     if (EMAIL_REGEX.test(value)) type = "email";
@@ -342,13 +464,15 @@ function detect(line) {
   }
 
   // ─────────────────────────
-  // 2️⃣ ARGUMENT / INLINE STRINGS
+  // 2️⃣ INLINE STRINGS
   // ─────────────────────────
   while ((m = STRING_LITERAL_REGEX.exec(line))) {
     const value = m[1];
 
+    // 🚫 Skip placeholders
+    if (isSecretPlaceholderValue(value)) continue;
+
     if (seen.has(value)) continue;
-    if (value === "NOT_DECRYPTED_YET") continue;
 
     let type = null;
     if (EMAIL_REGEX.test(value)) type = "email";
@@ -357,12 +481,7 @@ function detect(line) {
     else if (isLikelyKey(value)) type = "genericKey";
     else continue;
 
-    found.push({
-      value,
-      type,
-      variable: null // argument / inline
-    });
-
+    found.push({ value, type, variable: null });
     seen.add(value);
   }
 
@@ -371,11 +490,12 @@ function detect(line) {
 
 
 
+
 /*********************************
  * EXTENSION
  *********************************/
 
-function setupProtectionWatchers(context) {
+function setupProtectionWatchers(extensionContext) {
   // ─────────────────────────────
   // FILE SYSTEM WATCHERS
   // ─────────────────────────────
@@ -420,7 +540,7 @@ function setupProtectionWatchers(context) {
     });
   });
 
-  context.subscriptions.push(keyWatcher, storeWatcher);
+  extensionContext.subscriptions.push(keyWatcher, storeWatcher);
 }
 
 
@@ -590,16 +710,88 @@ function isWrappedStringLiteral(text) {
   return backslashes % 2 === 0;
 }
 
+let extensionContext;
+
+function updateShielderStatus(mode) {
+  if (!shielderStatusBar) return;
+
+  if (mode === "machine") {
+    shielderStatusBar.text = "🔐 Shielder: Machine Key";
+  } else if (mode === "project") {
+    shielderStatusBar.text = "🔐 Shielder: Project Key";
+  } else {
+    shielderStatusBar.text = "🔓 Shielder: Not Protected";
+  }
+}
+
 
 
 function activate(context) {
-setupProtectionWatchers(context);
+ extensionContext = context;
+  console.log("[Shielder] Extension activated");
+
+
+
+
+
+
+  shielderStatusBar = vscode.window.createStatusBarItem(
+  vscode.StatusBarAlignment.Right,
+  100
+);
+
+shielderStatusBar.tooltip = "Shielder protection mode";
+shielderStatusBar.command = "shielder.showProtectionInfo"; // optional
+shielderStatusBar.show();
+
+extensionContext.subscriptions.push(shielderStatusBar);
+
+setupProtectionWatchers(extensionContext);
   // also run once on activation
-  handleWorkspaceOpen(context);
+  handleWorkspaceOpen(extensionContext);
 
 
 
-  context.subscriptions.push(
+  extensionContext.subscriptions.push(
+  vscode.commands.registerCommand("shielder.showProtectionInfo", async () => {
+    const ws = vscode.workspace.workspaceFolders?.[0];
+    if (!ws) return;
+
+    const store = await loadSecretFile(ws, { createIfMissing: false });
+
+    if (!store || !store.data?.mode) {
+      await vscode.window.showInformationMessage(
+        "🔓 Shielder is not protecting this project yet.",
+        { modal: true },
+        "OK"
+      );
+      return;
+    }
+
+      vscode.window.showInformationMessage(
+      `🔐 Shielder is using ${store.data.mode === "machine"
+        ? "Machine-based protection"
+        : "Project-based protection"
+      }.`
+    );
+
+    const mode = store.data.mode;
+
+    const message =
+      mode === "machine"
+        ? "🔐 Shielder Protection Mode: MACHINE"
+        : "🔐 Shielder Protection Mode: PROJECT";
+
+    await vscode.window.showInformationMessage(
+      message,
+      { modal: true },
+      "OK"
+    );
+  })
+);
+
+
+  extensionContext.subscriptions.push(
   vscode.commands.registerCommand(
     "shielder.revertSelectionInline",
     async (uri, range) => {
@@ -620,8 +812,20 @@ setupProtectionWatchers(context);
 
       const placeholder = match[0];
 
-      const store = await loadSecretFile(ws);
-      const key = await getProjectKey(ws);
+    const store = await loadSecretFile(ws);
+
+let key;
+if (store.data.mode === "project") {
+  key = await getProjectKey(ws);
+} else {
+  const mk = await extensionContext.secrets.get("shielder.machineKey");
+  if (!mk) {
+    vscode.window.showErrorMessage("Machine key missing.");
+    return;
+  }
+  key = Buffer.from(mk, "hex");
+}
+
 
       const secret = store.data.secrets.find(
         s => s.placeholder === placeholder && !s.disabled
@@ -663,14 +867,14 @@ setupProtectionWatchers(context);
   )
 );
 
-  context.subscriptions.push(
+  extensionContext.subscriptions.push(
     vscode.workspace.onDidChangeWorkspaceFolders(async () => {
-      await handleWorkspaceOpen(context);
+      await handleWorkspaceOpen(extensionContext);
     })
   );
 
 
-context.subscriptions.push(
+extensionContext.subscriptions.push(
   vscode.workspace.onDidChangeTextDocument(async event => {
     const editor = vscode.window.activeTextEditor;
     if (!editor) return;
@@ -709,7 +913,7 @@ context.subscriptions.push(
 // ─────────────────────────────
 // Block managed files on open / focus
 
-context.subscriptions.push(
+extensionContext.subscriptions.push(
   vscode.languages.registerCodeActionsProvider(
     ["javascript", "typescript", "javascriptreact", "typescriptreact", "json"],
     {
@@ -805,7 +1009,7 @@ provideCodeActions(document, range) {
 );
 
 
-context.subscriptions.push(
+extensionContext.subscriptions.push(
   vscode.commands.registerCommand(
     "shielder.protectSelectionInline",
     async (uri, range, value) => {
@@ -814,7 +1018,21 @@ context.subscriptions.push(
 
       await ensureProjectKey(ws);
       const store = await loadSecretFile(ws);
-      const key = await getProjectKey(ws);
+
+let key;
+if (store.data.mode === "project") {
+  await ensureProjectKey(ws);
+  key = await getProjectKey(ws);
+} else {
+  const mk = await extensionContext.secrets.get("shielder.machineKey");
+  if (!mk) {
+    await generateMachineKey(extensionContext);
+  }
+  key = Buffer.from(
+    await extensionContext.secrets.get("shielder.machineKey"),
+    "hex"
+  );
+}
 
       const editor = await vscode.window.showTextDocument(uri);
 
@@ -870,7 +1088,7 @@ await editor.edit(edit => {
 );
 
 
-context.subscriptions.push(
+extensionContext.subscriptions.push(
   vscode.workspace.onDidOpenTextDocument(doc => {
     const editor = vscode.window.visibleTextEditors.find(
       e => e.document === doc
@@ -879,30 +1097,44 @@ context.subscriptions.push(
   })
 );
 
-context.subscriptions.push(
+extensionContext.subscriptions.push(
   vscode.window.onDidChangeActiveTextEditor(editor => {
     handleManagedFileOpen(editor);
   })
 );
 
-
-context.subscriptions.push(
+extensionContext.subscriptions.push(
   vscode.commands.registerCommand("shielder.revertProject", async () => {
     const ws = vscode.workspace.workspaceFolders?.[0];
     if (!ws) return;
-     // ✅ DECLARE it properly
-    const protectedProject = await isProjectProtected(ws);
 
-    if (!protectedProject) {
-      openNotProtectedWebview(ws);
+    const state = await getProtectionState(extensionContext, ws);
+
+    if (!state.protected) {
+      if (!state.store || !state.mode) {
+        openOnOpenWarning(ws);
+        return;
+      }
+
+      if (state.reason === "missing-machine-key") {
+        openGenerateMachineKey(extensionContext);
+        return;
+      }
+
+      vscode.window.showWarningMessage(
+        "🔐 Project is not fully protected yet."
+      );
       return;
     }
-    openRevertConfirm(context, ws);
+
+    // ✅ safe
+    openRevertConfirm(extensionContext, ws);
   })
 );
 
 
-  context.subscriptions.push(
+
+  extensionContext.subscriptions.push(
     vscode.commands.registerCommand("shielder.exportKey", async () => {
       const ws = vscode.workspace.workspaceFolders?.[0];
       if (!ws) {
@@ -915,28 +1147,41 @@ context.subscriptions.push(
   );
 
 
-context.subscriptions.push(
+extensionContext.subscriptions.push(
   vscode.commands.registerCommand("shielder.manageSecrets", async () => {
     const ws = vscode.workspace.workspaceFolders?.[0];
     if (!ws) return;
 
-    // ✅ DECLARE it properly
-    const protectedProject = await isProjectProtected(ws);
+    const state = await getProtectionState(extensionContext, ws);
 
-    if (!protectedProject) {
-      openNotProtectedWebview(ws);
+    if (!state.protected) {
+      if (!state.store || !state.mode) {
+        openOnOpenWarning(ws); // choose mode
+        return;
+      }
+
+      if (state.reason === "missing-machine-key") {
+        openGenerateMachineKey(extensionContext);
+        return;
+      }
+
+      vscode.window.showWarningMessage(
+        "🔐 Project is not fully protected yet."
+      );
       return;
     }
-   openManageSecrets(ws);
+
+    // ✅ safe
+    openManageSecrets(ws);
   })
 );
 
-
-
   /* -------- SCAN PROJECT -------- */
- context.subscriptions.push(
+
+// ---------- Replace all existing shielder.scan handlers with this single implementation ----------
+extensionContext.subscriptions.push(
   vscode.commands.registerCommand("shielder.scan", async () => {
-    await context.workspaceState.update("shielder.reverted", false);
+    console.log("[Shielder] scan command invoked");
 
     const ws = vscode.workspace.workspaceFolders?.[0];
     if (!ws) {
@@ -946,12 +1191,52 @@ context.subscriptions.push(
       return;
     }
 
+    // ─────────────────────────────
+    // STEP 1: Load store (ALWAYS create before scan)
+    // ─────────────────────────────
+    const store = await loadSecretFile(ws);
+    if (!store || !store.data) {
+      vscode.window.showErrorMessage("Failed to load secret store.");
+      return;
+    }
+
+    const mode = store.data.mode ?? null;
+    if (!mode) {
+      openOnOpenWarning(ws);
+      return;
+    }
+
     vscode.window.showInformationMessage("🔍 Scanning project for secrets…");
 
-    await ensureProjectKey(ws);
-    const store = await loadSecretFile(ws);
-    const key = await getProjectKey(ws);
+    // ─────────────────────────────
+    // STEP 2: Resolve encryption key
+    // ─────────────────────────────
+    let key;
 
+    if (mode === "project") {
+      // 🔐 Project mode (unchanged logic)
+      await ensureProjectKey(ws);
+      key = await getProjectKey(ws); // must be Buffer
+    } else {
+      // 🔐 Machine mode
+      let stored = await extensionContext.secrets.get("shielder.machineKey");
+      if (!stored) {
+        key = await generateMachineKey(extensionContext); // returns Buffer
+      } else {
+        key = Buffer.from(stored, "hex");
+      }
+    }
+
+    if (!Buffer.isBuffer(key) || key.length !== 32) {
+      vscode.window.showErrorMessage("Invalid encryption key.");
+      return;
+    }
+
+    console.log("[Shielder] mode:", mode, "key length:", key.length);
+
+    // ─────────────────────────────
+    // STEP 3: Scan files
+    // ─────────────────────────────
     const files = await vscode.workspace.findFiles(
       "**/*.{js,ts,jsx,tsx}",
       "**/node_modules/**"
@@ -963,115 +1248,75 @@ context.subscriptions.push(
     for (const file of files) {
       if (shouldSkipScanFile(file)) continue;
 
+      let original;
       try {
-        const text = (await vscode.workspace.fs.readFile(file)).toString();
-        const lines = text.split("\n");
+        original = (await vscode.workspace.fs.readFile(file)).toString();
+      } catch {
+        continue;
+      }
 
-        // ─────────────────────────────
-        // FILE-LEVEL GATE (LINE-BASED)
-        // ─────────────────────────────
-        const fileHasSecrets = lines.some(line => detect(line).length > 0);
-        if (!fileHasSecrets) continue;
+      const lines = original.split("\n");
+      let changed = false;
+      const relPath = path.relative(ws.uri.fsPath, file.fsPath);
 
-        let updated = text;
+      for (let i = 0; i < lines.length; i++) {
+        const found = detect(lines[i]);
+        if (!found.length) continue;
 
-        // ─────────────────────────────
-        // Ensure resolveSecret import
-        // ─────────────────────────────
-        const hasResolverImport = lines.some(
-          l =>
-            l.includes('import { resolveSecret }') &&
-            l.includes('@shielder/runtime')
-        );
+        for (const s of found) {
+          detectedAny = true;
+          const hash = hashValue(s.value);
 
-        if (!hasResolverImport) {
-          let insertAt = 0;
-          while (
-            insertAt < lines.length &&
-            (lines[insertAt].startsWith("import ") ||
-              lines[insertAt].startsWith("require("))
-          ) {
-            insertAt++;
+          // reuse placeholder if secret already known
+          const existing = store.data.secrets.find(e => e.hash === hash);
+          const placeholder =
+            existing?.placeholder ??
+            `<SECRET_${crypto.randomBytes(4).toString("hex").toUpperCase()}>`;
+
+          // replace ONLY if not already protected
+          if (lines[i].includes("resolveSecret(")) continue;
+
+          let encrypted;
+          try {
+            encrypted = existing?.encrypted ?? encryptWithKey(key, s.value);
+          } catch (err) {
+            console.error("[Shielder] encryption failed:", err);
+            continue;
           }
 
-          lines.splice(
-            insertAt,
-            0,
+          lines[i] = lines[i]
+            .replace(`"${s.value}"`, `resolveSecret("${placeholder}")`)
+            .replace(`'${s.value}'`, `resolveSecret("${placeholder}")`);
+
+          store.data.secrets.push({
+            id: crypto.randomBytes(4).toString("hex"),
+            type: s.type,
+            hash,
+            file: relPath,
+            line: i + 1,
+            placeholder,
+            variable: s.variable,
+            encrypted,
+            disabled: false
+          });
+
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        if (!original.includes('@shielder/runtime')) {
+          lines.unshift(
             'import { resolveSecret } from "@shielder/runtime";'
           );
         }
 
-        // ─────────────────────────────
-        // LINE-BY-LINE REPLACEMENT
-        // ─────────────────────────────
-        for (let i = 0; i < lines.length; i++) {
-          const found = detect(lines[i]);
-          if (!found.length) continue;
-
-          for (const s of found) {
-            detectedAny = true;
-            const hash = hashValue(s.value);
-
-            // 🔥 IMPORTANT FIX:
-            // If secret already exists → STILL replace in this file
-            const existing = store.data.secrets.find(e => e.hash === hash);
-
-            if (existing) {
-              if (!lines[i].includes("resolveSecret(")) {
-                lines[i] = lines[i]
-                  .replace(
-                    `"${s.value}"`,
-                    `resolveSecret("${existing.placeholder}")`
-                  )
-                  .replace(
-                    `'${s.value}'`,
-                    `resolveSecret("${existing.placeholder}")`
-                  );
-              }
-              continue;
-            }
-
-            // New secret
-            const id = crypto.randomBytes(4).toString("hex");
-            const placeholder = `<SECRET_${id.toUpperCase()}>`;
-            const encrypted = encryptWithKey(key, s.value);
-
-            if (!lines[i].includes("resolveSecret(")) {
-              lines[i] = lines[i]
-                .replace(
-                  `"${s.value}"`,
-                  `resolveSecret("${placeholder}")`
-                )
-                .replace(
-                  `'${s.value}'`,
-                  `resolveSecret("${placeholder}")`
-                );
-            }
-
-            store.data.secrets.push({
-              id,
-              type: s.type,
-              hash,
-              file: path.relative(ws.uri.fsPath, file.fsPath),
-              line: i + 1,
-              placeholder,
-              variable: s.variable,
-              encrypted,
-              disabled: false
-            });
-          }
-        }
-
-        updated = lines.join("\n");
-
-        if (updated !== text) {
-          await vscode.workspace.fs.writeFile(file, Buffer.from(updated));
-          updatedFiles++;
-        }
-      } catch (err) {
-        vscode.window.showWarningMessage(
-          `❌ Failed to read file: ${path.basename(file.fsPath)}`
+        await vscode.workspace.fs.writeFile(
+          file,
+          Buffer.from(lines.join("\n"))
         );
+
+        updatedFiles++;
       }
     }
 
@@ -1080,6 +1325,9 @@ context.subscriptions.push(
       return;
     }
 
+    // ─────────────────────────────
+    // STEP 4: Persist store (ONCE)
+    // ─────────────────────────────
     await vscode.workspace.fs.writeFile(
       store.uri,
       Buffer.from(JSON.stringify(store.data, null, 2))
@@ -1088,55 +1336,14 @@ context.subscriptions.push(
     vscode.window.showInformationMessage(
       `🔐 Secrets protected: ${updatedFiles} files updated`
     );
+
+    updateShielderStatus(mode);
+
   })
 );
 
 
-  /* -------- ROTATE PROJECT KEY (9.4.2) -------- */
-  context.subscriptions.push(
-    vscode.commands.registerCommand("shielder.rotateKey", async () => {
-      const ws = vscode.workspace.workspaceFolders?.[0];
-      if (!ws) return;
 
-      const confirm = await vscode.window.showWarningMessage(
-        "♻️ Rotate project key? Old exported keys will stop working.",
-        { modal: true },
-        "Rotate"
-      );
-
-      if (confirm !== "Rotate") return;
-
-      const store = await loadSecretFile(ws);
-      const oldKey = await getProjectKey(ws);
-
-      // 1️⃣ Decrypt all secrets in memory
-      const plaintexts = store.data.secrets.map(s =>
-        decryptWithKey(oldKey, s.encrypted)
-      );
-
-      // 2️⃣ Generate & write new key
-      const newKey = crypto.randomBytes(32);
-      await vscode.workspace.fs.writeFile(
-        vscode.Uri.joinPath(ws.uri, PROJECT_KEY_FILE),
-        newKey
-      );
-
-      // 3️⃣ Re-encrypt secrets
-      store.data.secrets.forEach((s, i) => {
-        s.encrypted = encryptWithKey(newKey, plaintexts[i]);
-      });
-
-      // 4️⃣ Save store
-      await vscode.workspace.fs.writeFile(
-        store.uri,
-        Buffer.from(JSON.stringify(store.data, null, 2))
-      );
-
-      vscode.window.showInformationMessage(
-        "♻️ Project key rotated successfully"
-      );
-    })
-  );
 }
 
 
@@ -1229,7 +1436,17 @@ async function findCurrentLine(ws, secret) {
 
   panel.webview.onDidReceiveMessage(async msg => {
     const store = await loadSecretFile(ws);
-    const key = await getProjectKey(ws);
+    let key;
+  if (store.data.mode === "project") {
+    key = await getProjectKey(ws);
+  } else {
+    const mk = await extensionContext.secrets.get("shielder.machineKey");
+    if (!mk) {
+      vscode.window.showErrorMessage("Machine key missing.");
+      return;
+    }
+    key = Buffer.from(mk, "hex");
+  }
 
     // ─────────────────────────────
     // 📥 INITIAL LOAD
@@ -2025,129 +2242,121 @@ function getExportKeyHTML() {
 //   openOnOpenWarning(ws);
 // }
 
-
-async function handleWorkspaceOpen(context) {
-
-const reverted = context.workspaceState.get("shielder.reverted", false);
-if (reverted) return;
-
-
+async function handleWorkspaceOpen(extensionContext) {
   const ws = vscode.workspace.workspaceFolders?.[0];
   if (!ws) return;
 
-  const config = vscode.workspace.getConfiguration("shielder");
-  const autoProtect = config.get("autoProtectOnOpen", false);
-// const alreadyShown = context.workspaceState.get("shielder.warningShown", false);
+  const store = await loadSecretFile(ws, { createIfMissing: false });
 
-const alreadyShown = context.workspaceState.get(
-  "shielder.warningShown",
-  false
-);
-
-
-  // ─────────────────────────────
-  // 1️⃣ AUTO PROTECT (OPT-IN)
-  // ─────────────────────────────
-  if (autoProtect) {
-    try {
-      // Already protected → nothing to do
-      await vscode.workspace.fs.readFile(
-        vscode.Uri.joinPath(ws.uri, ".ai-secret-guard.json")
-      );
-      return;
-    } catch {
-      // Not protected → auto scan silently
-      vscode.commands.executeCommand("shielder.scan");
-      return;
-    }
-  }
-
-  // ─────────────────────────────
-  // 2️⃣ DEFAULT MODE → WARNING FLOW
-  // ─────────────────────────────
-
-  // Already protected → do nothing
-  try {
-    await vscode.workspace.fs.readFile(
-      vscode.Uri.joinPath(ws.uri, ".ai-secret-guard.json")
-    );
+  if (!store || !store.data?.mode) {
+     updateShielderStatus(null);
+    openOnOpenWarning(ws); // soft hint
     return;
-  } catch { }
-
-  // Light scan for suspicious secrets
-  const files = await vscode.workspace.findFiles(
-    "**/*.{js,ts,env,json}",
-    "**/node_modules/**",
-    10 // limit for speed
-  );
-
-  let suspicious = false;
-
-  for (const file of files) {
-    try {
-      const text = (await vscode.workspace.fs.readFile(file)).toString();
-      if (
-        /sk_live_|sk_test_|AIzaSy|AKIA|SECRET|API_KEY/i.test(text)
-      ) {
-        suspicious = true;
-        break;
-      }
-    } catch { }
   }
 
- // Show warning if suspicious OR first-time open
-if (!suspicious && alreadyShown) return;
+  // if (store.data.mode === "machine") {
+  //   const mk = await extensionContext.secrets.get("shielder.machineKey");
+  //   if (!mk) {
+  //     await generateMachineKey(extensionContext);
+  //     vscode.window.showInformationMessage(
+  //       "🔐 Machine key generated locally."
+  //     );
+  //   }
+  // }
 
-openOnOpenWarning(ws);
+  updateShielderStatus(store.data.mode);
+}
 
-// persist flag (workspace-level)
-await context.workspaceState.update("shielder.warningShown", true);
-
-
+function isSecretPlaceholderValue(value) {
+  return /^<SECRET_[A-Z0-9]+>$/.test(value);
 }
 
 
-function openOnOpenWarning(ws) {
-  const panel = vscode.window.createWebviewPanel(
+async function generateMachineKey(extensionContext) {
+  const key = crypto.randomBytes(32).toString("hex"); // 64 hex chars
+  await extensionContext.secrets.store("shielder.machineKey", key);
+  return Buffer.from(key, "hex"); // IMPORTANT
+}
+
+
+let onOpenWarningPanel = null;
+
+function openOnOpenWarning(ws, options = {}) {
+
+   if (onOpenWarningPanel) {
+    onOpenWarningPanel.reveal();
+    return;
+  }
+
+
+  onOpenWarningPanel = vscode.window.createWebviewPanel(
     "shielderOnOpenWarning",
     "Shielder — Security Warning",
     vscode.ViewColumn.Active,
     { enableScripts: true }
   );
 
-  panel.webview.html = getOnOpenWarningHTML();
+  onOpenWarningPanel.webview.html = getOnOpenWarningHTML();
 
-  panel.webview.onDidReceiveMessage(async msg => {
-
-    if (msg.type === "protect") {
-      panel.dispose();
-      vscode.commands.executeCommand("shielder.scan");
-      return;
-    }
-
-    if (msg.type === "protect-always") {
-      const config = vscode.workspace.getConfiguration("shielder");
-
-      await config.update(
-        "autoProtectOnOpen",
-        true,
-        vscode.ConfigurationTarget.Workspace
-      );
-
-      panel.dispose();
-      vscode.commands.executeCommand("shielder.scan");
-      return;
-    }
-
-    if (msg.type === "ignore") {
-      panel.dispose();
-      return;
-    }
+  onOpenWarningPanel.onDidDispose(() => {
+    onOpenWarningPanel = null;
   });
 
+ onOpenWarningPanel.webview.onDidReceiveMessage(async msg => {
+
+  if (msg.type === "protect-default") {
+    onOpenWarningPanel.dispose();
+
+    // set mode = project
+    const ws = vscode.workspace.workspaceFolders?.[0];
+    if (!ws) return;
+
+    const store =
+      (await loadSecretFile(ws, { createIfMissing: false })) ??
+      (await loadSecretFile(ws)); // create now
+
+    store.data.mode = "project";
+
+    await vscode.workspace.fs.writeFile(
+      store.uri,
+      Buffer.from(JSON.stringify(store.data, null, 2))
+    );
+updateShielderStatus("project");
+    vscode.commands.executeCommand("shielder.scan");
+    return;
+  }
+
+  if (msg.type === "protect-machine") {
+    onOpenWarningPanel.dispose();
+
+    const ws = vscode.workspace.workspaceFolders?.[0];
+    if (!ws) return;
+
+    const store =
+      (await loadSecretFile(ws, { createIfMissing: false })) ??
+      (await loadSecretFile(ws)); // create now
+
+    store.data.mode = "machine";
+
+    await vscode.workspace.fs.writeFile(
+      store.uri,
+      Buffer.from(JSON.stringify(store.data, null, 2))
+    );
+updateShielderStatus("project");
+     vscode.commands.executeCommand("shielder.scan");
+    // do NOT scan yet – machine key must be generated first
+   // openGenerateMachineKey(extensionContext);
+    return;
+  }
+
+  if (msg.type === "ignore") {
+    onOpenWarningPanel.dispose();
+    return;
+  }
+});
+
+
 }
-
-
 
 function getOnOpenWarningHTML() {
   return `
@@ -2330,7 +2539,7 @@ function getOnOpenWarningHTML() {
     <div class="header">
       <div class="icon">🔐</div>
       <div>
-        <h2>ShielderX Warning</h2>
+        <h2>ShielderX</h2>
         <div class="subtle">Proactive protection before AI tools access code</div>
       </div>
     </div>
@@ -2431,51 +2640,82 @@ function getOnOpenWarningHTML() {
 </html>`;
 }
 
-
-
 /*
 
   Revert Project logic
 
 */
 
-async function revertProject(context, ws) {
+async function revertProject(extensionContext, ws) {
   const storeUri = vscode.Uri.joinPath(ws.uri, SECRET_FILE);
   const keyUri = vscode.Uri.joinPath(ws.uri, PROJECT_KEY_FILE);
 
   let store;
 
-  // 1️⃣ Load existing secret store (DO NOT auto-create)
+  // 1️⃣ Load store (if missing, still attempt cleanup)
   try {
     const raw = await vscode.workspace.fs.readFile(storeUri);
     store = JSON.parse(raw.toString());
   } catch {
-    vscode.window.showWarningMessage(
-      "No protected secrets found to revert."
-    );
-    return;
+    store = { secrets: [] };
   }
 
-  const key = await getProjectKey(ws);
+  // 2️⃣ Load project key if present
+ let key = null;
 
-  // 2️⃣ Restore secrets back into source files
-  for (const s of store.secrets) {
-    const fileUri = vscode.Uri.joinPath(ws.uri, s.file);
+try {
+  // project mode
+  key = await getProjectKey(ws);
+} catch {
+  // machine mode fallback
+  const mk = await extensionContext.secrets.get("shielder.machineKey");
+  if (mk) {
+    key = Buffer.from(mk, "hex");
+  }
+}
+
+
+  // 3️⃣ Group secrets by file
+  const secretsByFile = new Map();
+  for (const s of store.secrets || []) {
+    if (!secretsByFile.has(s.file)) {
+      secretsByFile.set(s.file, []);
+    }
+    secretsByFile.get(s.file).push(s);
+  }
+
+  // 4️⃣ Revert files
+  for (const [relativePath, secrets] of secretsByFile.entries()) {
+    const fileUri = vscode.Uri.joinPath(ws.uri, relativePath);
     let content = (await vscode.workspace.fs.readFile(fileUri)).toString();
 
-    const plaintext = decryptWithKey(key, s.encrypted);
+    // 4a️⃣ Replace known secrets
+    for (const s of secrets) {
+      if (!key) continue;
 
-    // resolveSecret("PLACEHOLDER") → "plaintext"
+      const plaintext = decryptWithKey(key, s.encrypted);
+      const knownPattern = new RegExp(
+        `resolveSecret\\s*\\(\\s*["']${s.placeholder}["']\\s*\\)`,
+        "g"
+      );
+
+      content = content.replace(knownPattern, `"${plaintext}"`);
+    }
+
+    // 4b️⃣ 🔥 FINAL SAFETY NET
+    // Replace ANY remaining resolveSecret("<SECRET_...>")
     content = content.replace(
-      new RegExp(`resolveSecret\\(["']${s.placeholder}["']\\)`, "g"),
-      `"${plaintext}"`
+      /resolveSecret\s*\(\s*["']<SECRET_[A-Z0-9]+>["']\s*\)/g,
+      '""'
     );
 
-    // remove runtime import if present
-    content = content.replace(
-      /import\s+\{\s*resolveSecret\s*\}\s+from\s+["']@shielder\/runtime["'];?\n?/g,
-      ""
-    );
+    // 4c️⃣ Remove runtime import if no resolveSecret remains
+    if (!content.includes("resolveSecret(")) {
+      content = content.replace(
+        /import\s+\{\s*resolveSecret\s*\}\s+from\s+["']@shielder\/runtime["'];?\s*\n?/g,
+        ""
+      );
+    }
 
     await vscode.workspace.fs.writeFile(
       fileUri,
@@ -2483,39 +2723,32 @@ async function revertProject(context, ws) {
     );
   }
 
-  // 3️⃣ Mark internal deletes (CRITICAL)
+  // 5️⃣ Mark internal deletes
   markInternalOp(keyUri);
   markInternalOp(storeUri);
 
-  try {
-    await vscode.workspace.fs.delete(keyUri);
-  } catch {}
+  // 6️⃣ Delete key + store
+  try { await vscode.workspace.fs.delete(keyUri); } catch {}
+  try { await vscode.workspace.fs.delete(storeUri); } catch {}
 
-  try {
-    await vscode.workspace.fs.delete(storeUri);
-  } catch {}
-
-  // 4️⃣ Unmark after delete
+  // 7️⃣ Unmark
   unmarkInternalOp(keyUri);
   unmarkInternalOp(storeUri);
 
-  // 5️⃣ Remember that user explicitly reverted this project
-  await context.workspaceState.update("shielder.reverted", true);
+  // 8️⃣ Close editors
+  await vscode.commands.executeCommand("workbench.action.closeAllEditors");
 
-  // 6️⃣ Friendly confirmation
+  // 9️⃣ Done
   vscode.window.showInformationMessage(
-    "Shielder protection removed. Secrets restored to source code.",
-    "Re-Protect"
-  ).then(choice => {
-    if (choice === "Re-Protect") {
-      vscode.commands.executeCommand("shielder.scan");
-    }
-  });
+    "🔓 Shielder protection removed. All secrets restored or cleaned."
+  );
+  updateShielderStatus(null);
+
 }
 
 
 
-function openRevertConfirm(context, ws) {
+function openRevertConfirm(extensionContext, ws) {
   const panel = vscode.window.createWebviewPanel(
     "shielderRevertConfirm",
     "Shielder — Revert Protection",
@@ -2533,7 +2766,7 @@ function openRevertConfirm(context, ws) {
 
     if (msg.type === "revert") {
       panel.dispose();
-      await revertProject(context, ws);
+      await revertProject(extensionContext, ws);
     }
   });
 }
@@ -2698,143 +2931,42 @@ async function isProjectProtected(ws) {
   }
 }
 
+async function getProtectionState(extensionContext, ws) {
+  const store = await loadSecretFile(ws, { createIfMissing: false });
+  if (!store) {
+    return { protected: false };
+  }
 
-function openNotProtectedWebview(ws) {
-  const panel = vscode.window.createWebviewPanel(
-    "shielderNotProtected",
-    "Shielder — Project Not Protected",
-    vscode.ViewColumn.Active,
-    { enableScripts: true }
-  );
+  const mode = store.data?.mode ?? null;
+  if (!mode) {
+    return { protected: false, store };
+  }
 
-  panel.webview.html = getNotProtectedHTML();
-
-  panel.webview.onDidReceiveMessage(msg => {
-    if (msg.type === "cancel") {
-      panel.dispose();
-      return;
+  if (mode === "machine") {
+    const machineKey = await extensionContext.secrets.get("shielder.machineKey");
+    if (!machineKey) {
+      return { protected: false, mode, store, reason: "missing-machine-key" };
     }
-
-    if (msg.type === "protect") {
-      panel.dispose();
-      vscode.commands.executeCommand("shielder.scan");
+  } else if (mode === "project") {
+    try {
+      await getProjectKey(ws); // check only
+    } catch {
+      return { protected: false, mode, store, reason: "missing-project-key" };
     }
-  });
+  }
+
+  return { protected: true, mode, store };
 }
 
-
-function getNotProtectedHTML() {
-  return `
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8" />
-<style>
-  body {
-    margin: 0;
-    font-family: var(--vscode-font-family);
-    background: rgba(0,0,0,0.55);
-    height: 100vh;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
- .danger {
-    background: #d16969;
-    color: white;
-    box-shadow: 0 6px 18px rgba(0,0,0,0.45);
-  }
-  .card {
-    width: 520px;
-    background: var(--vscode-editor-background);
-    border-radius: 14px;
-    padding: 26px 28px;
-    box-shadow: 0 30px 80px rgba(0,0,0,0.75);
-    border: 1px solid rgba(255, 193, 7, 0.35);
-  }
-
-  h2 {
-    margin: 0;
-    font-size: 18px;
-    font-weight: 600;
-  }
-
-  .desc {
-    margin-top: 12px;
-    font-size: 13px;
-    line-height: 1.55;
-    opacity: 0.9;
-  }
-
-  .note {
-    font-size: 12px;
-    opacity: 0.8;
-    margin-top: 10px;
-  }
-
-  .actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 12px;
-    margin-top: 22px;
-  }
-
-  button {
-    padding: 8px 16px;
-    font-size: 13px;
-    border-radius: 8px;
-    border: none;
-    cursor: pointer;
-  }
-
-  .secondary {
-    background: transparent;
-    border: 1px solid var(--vscode-editorGroup-border);
-    color: var(--vscode-editor-foreground);
-  }
-
-  .primary {
-    background: #0e639c;
-    color: white;
-    box-shadow: 0 6px 18px rgba(0,0,0,0.45);
-  }
-</style>
-</head>
-
-<body>
-  <div class="card">
-    <h2>🔒 Project Not Protected</h2>
-
-    <div class="desc">
-      This project is currently not protected by Shielder.
-    </div>
-
-    <div class="note">
-      To manage secrets, the project must be protected first.
-    </div>
-
-    <div class="actions">
-       <button class="secondary" onclick="cancel()">Cancel</button>
-      <button class="danger" onclick="protect()">Protect Now</button>
-    </div>
-  </div>
-
-<script>
-  const vscode = acquireVsCodeApi();
-
-  function cancel() {
-    vscode.postMessage({ type: "cancel" });
-  }
-
-  function protect() {
-    vscode.postMessage({ type: "protect" });
-  }
-</script>
-</body>
-</html>`;
-}
 
 function deactivate() { }
 
 module.exports = { activate, deactivate };
+
+/*
+All the changes are done and noe we will move to generate key logic on machine level .
+*/
+
+/*
+Hope this will be an placeholder to revert back the change if its needed
+*/

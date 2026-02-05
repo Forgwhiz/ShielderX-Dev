@@ -36,6 +36,10 @@
     {
       "command": "shielder.revertProject",
       "title": "ShielderX: Revert Project"
+    },
+    {
+      "command": "shielder.showProtectionInfo",
+      "title": "ShielderX: Protection Key Info"
     }
     
   ]
