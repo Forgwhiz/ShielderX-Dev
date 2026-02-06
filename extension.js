@@ -20,6 +20,9 @@ const ALGORITHM = "aes-256-gcm";
 const PROJECT_KEY_FILE = ".shielder.key";
 const SECRET_FILE = ".ai-secret-guard.json";
 
+const RECOVERY_FILE = ".shielder.recovery";
+
+
 /*********************************
  * REGEX RULES
  *********************************/
@@ -54,8 +57,9 @@ const HARD_EXCLUDED_FILES = new Set([
   const internalFsOps = new Set();
 
 const SHIELDER_INTERNAL_FILES = new Set([
-  PROJECT_KEY_FILE,          // .shielder.key
-  SECRET_FILE                // .ai-secret-guard.json
+  PROJECT_KEY_FILE, // .shielder.key
+  SECRET_FILE,  // .ai-secret-guard.json
+  RECOVERY_FILE          
 ]);
 
 /*********************************
@@ -141,11 +145,17 @@ async function generateProjectFingerprint(workspaceFolder) {
   const stat = await vscode.workspace.fs.stat(workspaceFolder.uri);
   const created = stat.ctime.toString();
 
-  const salt = crypto.randomBytes(16).toString("hex");
+  const salt = crypto
+    .createHash("sha256")
+    .update(`shielderx:${workspaceFolder.uri.fsPath}`)
+    .digest("hex")
+    .slice(0, 32);
+
   const raw = `${rootPath}|${pkgName}|${created}|${salt}`;
 
   return crypto.createHash("sha256").update(raw).digest("hex");
 }
+
 
 /*********************************
  * KEY MANAGEMENT
@@ -187,6 +197,90 @@ async function ensureProjectKey(workspaceFolder) {
       "🔐 Project key generated. Backup `.shielder.key`. Losing it = losing secrets."
     );
   }
+}
+
+async function writeRecoveryFile(ws, extensionContext) {
+  const key = await getProjectKey(ws);
+  const store = await loadSecretFile(ws, { createIfMissing: false });
+  if (!store) return;
+
+  const keyHash = sha256(
+    await vscode.workspace.fs.readFile(
+      vscode.Uri.joinPath(ws.uri, PROJECT_KEY_FILE)
+    )
+  );
+
+  const storeHash = sha256(
+    Buffer.from(JSON.stringify(store.data))
+  );
+
+  const payload = JSON.stringify({
+    projectKey: key.toString("base64"),
+    store: store.data,
+    hashes: { key: keyHash, store: storeHash }
+  });
+
+  const fingerprint = await generateProjectFingerprint(ws);
+  const masterKey = crypto.scryptSync(
+    fingerprint,
+    "shielder-recovery",
+    32
+  );
+
+  const encrypted = encryptWithKey(masterKey, payload);
+
+  const recoveryUri = vscode.Uri.joinPath(ws.uri, RECOVERY_FILE);
+  markInternalOp(recoveryUri);
+
+  await vscode.workspace.fs.writeFile(
+    recoveryUri,
+    Buffer.from(JSON.stringify({ version: 1, encrypted }, null, 2))
+  );
+
+  unmarkInternalOp(recoveryUri);
+}
+
+async function restoreFromRecovery(ws) {
+  suspendAutoRestore(800);
+
+  const recoveryUri = vscode.Uri.joinPath(ws.uri, RECOVERY_FILE);
+
+  const raw = JSON.parse(
+    (await vscode.workspace.fs.readFile(recoveryUri)).toString()
+  );
+
+  const fingerprint = await generateProjectFingerprint(ws);
+  const masterKey = crypto.scryptSync(
+    fingerprint,
+    "shielder-recovery",
+    32
+  );
+
+  const decrypted = decryptWithKey(masterKey, raw.encrypted);
+  const snapshot = JSON.parse(decrypted);
+
+  // Restore key
+  const keyUri = vscode.Uri.joinPath(ws.uri, PROJECT_KEY_FILE);
+  markInternalOp(keyUri);
+  await vscode.workspace.fs.writeFile(
+    keyUri,
+    Buffer.concat([
+      Buffer.from("SHIELDER_KEY_v1\n"),
+      Buffer.from(snapshot.projectKey, "base64")
+    ])
+  );
+  unmarkInternalOp(keyUri);
+
+  // Restore store
+  const storeUri = vscode.Uri.joinPath(ws.uri, SECRET_FILE);
+  markInternalOp(storeUri);
+  await vscode.workspace.fs.writeFile(
+    storeUri,
+    Buffer.from(JSON.stringify(snapshot.store, null, 2))
+  );
+  unmarkInternalOp(storeUri);
+  await writeRecoveryFile(ws, extensionContext);
+
 }
 
 
@@ -252,6 +346,11 @@ function decryptWithKey(key, payload) {
 function hashValue(v) {
   return crypto.createHash("sha256").update(v).digest("hex");
 }
+
+function sha256(buf) {
+  return crypto.createHash("sha256").update(buf).digest("hex");
+}
+
 
 /*********************************
  * SECRET STORE
@@ -462,7 +561,12 @@ function detect(line) {
   return found;
 }
 
+let suspendAutoRestoreUntil = 0;
 
+
+function suspendAutoRestore(ms = 500) {
+  suspendAutoRestoreUntil = Date.now() + ms;
+}
 
 
 /*********************************
@@ -470,55 +574,118 @@ function detect(line) {
  *********************************/
 
 function setupProtectionWatchers(extensionContext) {
-  // ─────────────────────────────
-  // FILE SYSTEM WATCHERS
-  // ─────────────────────────────
+  const ws = vscode.workspace.workspaceFolders?.[0];
+  if (!ws) return;
+
   const keyWatcher = vscode.workspace.createFileSystemWatcher(
-    `**/${PROJECT_KEY_FILE}`
+    new vscode.RelativePattern(ws, PROJECT_KEY_FILE)
   );
 
   const storeWatcher = vscode.workspace.createFileSystemWatcher(
-    `**/${SECRET_FILE}`
+    new vscode.RelativePattern(ws, SECRET_FILE)
   );
 
+  const delayedVerify = async () => {
+    await new Promise(r => setTimeout(r, 50));
+    await verifyAndRestore(ws);
+  };
 
-
-  // 🔐 Key deleted (CRITICAL → modal)
-  keyWatcher.onDidDelete((uri) => {
+  // Edits
+  keyWatcher.onDidChange(uri => {
     if (isInternalOp(uri)) return;
-    vscode.window.showErrorMessage(
-      "🚨 Shielder key was deleted!\n\nSecrets can no longer be decrypted unless the key is restored.",
-      { modal: true },
-      "Learn more",
-      "OK"
-    ).then(selection => {
-      if (selection === "Learn more") {
-        openShielderIncidentWebview("key-deleted");
-      }
-    });
+    delayedVerify();
   });
 
- 
-  // 📦 Store deleted (CRITICAL → modal)
-  storeWatcher.onDidDelete((uri) => {
+  storeWatcher.onDidChange(uri => {
     if (isInternalOp(uri)) return;
-    vscode.window.showErrorMessage(
-      "🚨 Secret store was deleted!\n\nProtection state is lost unless restored.",
-      { modal: true },
-      "Learn more",
-      "OK"
-    ).then(selection => {
-      if (selection === "Learn more") {
-        openShielderIncidentWebview("store-deleted");
-      }
-    });
+    delayedVerify();
   });
 
-  extensionContext.subscriptions.push(keyWatcher, storeWatcher);
+  // Deletes → immediate
+  keyWatcher.onDidDelete(uri => {
+    if (isInternalOp(uri)) return;
+    verifyAndRestore(ws);
+  });
+
+  storeWatcher.onDidDelete(uri => {
+    if (isInternalOp(uri)) return;
+    verifyAndRestore(ws);
+  });
+
+  // Poll fallback (guarantee)
+  const interval = setInterval(() => {
+    verifyAndRestore(ws).catch(() => {});
+  }, 2000);
+
+  extensionContext.subscriptions.push(
+    keyWatcher,
+    storeWatcher,
+    { dispose: () => clearInterval(interval) }
+  );
 }
 
 
+async function verifyAndRestore(ws) {
+  // ⏸ Temporarily suspended during trusted writes
+  if (Date.now() < suspendAutoRestoreUntil) return;
+
+  const recoveryUri = vscode.Uri.joinPath(ws.uri, RECOVERY_FILE);
+  const keyUri = vscode.Uri.joinPath(ws.uri, PROJECT_KEY_FILE);
+  const storeUri = vscode.Uri.joinPath(ws.uri, SECRET_FILE);
+
+  // No recovery → nothing to enforce
+  let recovery;
+  try {
+    recovery = JSON.parse(
+      (await vscode.workspace.fs.readFile(recoveryUri)).toString()
+    );
+  } catch {
+    return;
+  }
+
+  // Decrypt recovery snapshot
+  let snapshot;
+  try {
+    const fingerprint = await generateProjectFingerprint(ws);
+    const masterKey = crypto.scryptSync(fingerprint, "shielder-recovery", 32);
+    snapshot = JSON.parse(
+      decryptWithKey(masterKey, recovery.encrypted)
+    );
+  } catch {
+    // Recovery exists but cannot decrypt → force restore
+    await restoreFromRecovery(ws);
+    return;
+  }
+
+  // Read current files
+  let keyBuf, storeBuf;
+  try { keyBuf = await vscode.workspace.fs.readFile(keyUri); } catch {}
+  try { storeBuf = await vscode.workspace.fs.readFile(storeUri); } catch {}
+
+  // Missing files → restore
+  if (!keyBuf || !storeBuf) {
+    await restoreFromRecovery(ws);
+    return;
+  }
+
+  // 🔐 HASH-BASED tamper detection
+  const currentKeyHash = sha256(keyBuf);
+  const currentStoreHash = sha256(storeBuf);
+
+  if (
+    currentKeyHash !== snapshot.hashes.key ||
+    currentStoreHash !== snapshot.hashes.store
+  ) {
+    await restoreFromRecovery(ws);
+  }
+}
+
+
+
+
 let blockingDialogActive = false;
+
+
 
 
 function handleManagedFileOpen(editor) {
@@ -625,6 +792,7 @@ async function handleShielderProtectCall(editor, lineNumber, lineText) {
       store.uri,
       Buffer.from(JSON.stringify(store.data, null, 2))
     );
+await writeRecoveryFile(ws, extensionContext);
 
     vscode.window.showInformationMessage(
       "🔐 Value protected successfully."
@@ -825,10 +993,14 @@ if (store.data.mode === "project") {
       // Mark as disabled (do NOT delete history)
       secret.disabled = true;
 
-      await vscode.workspace.fs.writeFile(
-        store.uri,
-        Buffer.from(JSON.stringify(store.data, null, 2))
-      );
+     suspendAutoRestore(800);
+markInternalOp(store.uri);
+await vscode.workspace.fs.writeFile(
+  store.uri,
+  Buffer.from(JSON.stringify(store.data, null, 2))
+);
+unmarkInternalOp(store.uri);
+
 
       vscode.window.showInformationMessage(
         "🔓 Value reverted successfully."
@@ -989,67 +1161,95 @@ extensionContext.subscriptions.push(
       await ensureProjectKey(ws);
       const store = await loadSecretFile(ws);
 
-let key;
-if (store.data.mode === "project") {
-  await ensureProjectKey(ws);
-  key = await getProjectKey(ws);
-} else {
-  key = await getOrCreateMachineKey(extensionContext);
-}
-
+      let key;
+      if (store.data.mode === "project") {
+        await ensureProjectKey(ws);
+        key = await getProjectKey(ws);
+      } else {
+        key = await getOrCreateMachineKey(extensionContext);
+      }
 
       const editor = await vscode.window.showTextDocument(uri);
 
       const id = crypto.randomBytes(4).toString("hex");
       const placeholder = `<SECRET_${id.toUpperCase()}>`;
-      const encrypted = encryptWithKey(key, value);
 
-     // 🔁 Normalize replacement range to full string literal
-let finalRange = range;
-let finalValue = value;
+      // ─────────────────────────────
+      // 🔁 Normalize replacement range
+      // ─────────────────────────────
+      let finalRange = range;
+      let finalValue = value;
 
-// If selection does NOT wrap a full string literal,
-// expand to the full string literal at cursor
-if (!isWrappedStringLiteral(value)) {
-  const found = findStringLiteralRange(
-    editor.document,
-    range.start
-  );
-  if (found) {
-    finalRange = found.range;
-    finalValue = found.value;
-  }
-}
+      // If selection does NOT wrap a full string literal,
+      // expand to the full string literal at cursor
+      if (!isWrappedStringLiteral(value)) {
+        const found = findStringLiteralRange(
+          editor.document,
+          range.start
+        );
+        if (found) {
+          finalRange = found.range;
+          finalValue = found.value;
+        }
+      }
 
-await editor.edit(edit => {
-  edit.replace(
-    finalRange,
-    `resolveSecret("${placeholder}")`
-  );
-});
+      // ─────────────────────────────
+      // 🔐 Normalize VALUE (strip quotes)
+      // ─────────────────────────────
+      let normalizedValue = finalValue;
 
+      if (
+        (normalizedValue.startsWith('"') && normalizedValue.endsWith('"')) ||
+        (normalizedValue.startsWith("'") && normalizedValue.endsWith("'"))
+      ) {
+        normalizedValue = normalizedValue.slice(1, -1);
+      }
 
+      // Encrypt ONLY the normalized value
+      const encrypted = encryptWithKey(key, normalizedValue);
+
+      // ─────────────────────────────
+      // ✍️ Replace source code
+      // ─────────────────────────────
+      await editor.edit(edit => {
+        edit.replace(
+          finalRange,
+          `resolveSecret("${placeholder}")`
+        );
+      });
+
+      // ─────────────────────────────
+      // 💾 Store metadata
+      // ─────────────────────────────
       store.data.secrets.push({
         id,
         type: "manual",
-        hash: hashValue(value),
+        hash: hashValue(normalizedValue),
         file: path.relative(ws.uri.fsPath, uri.fsPath),
-        line: range.start.line + 1,
+        line: finalRange.start.line + 1,
         placeholder,
         variable: null,
         encrypted,
         disabled: false
       });
 
+      // Store write is trusted
+      suspendAutoRestore(800);
+      markInternalOp(store.uri);
       await vscode.workspace.fs.writeFile(
         store.uri,
         Buffer.from(JSON.stringify(store.data, null, 2))
       );
+      unmarkInternalOp(store.uri);
+
+      // 🔐 Update recovery snapshot
+      await writeRecoveryFile(ws, extensionContext);
 
       vscode.window.showInformationMessage("🔐 Value protected.");
     }
   )
 );
+
 
 
 extensionContext.subscriptions.push(
@@ -1141,21 +1341,22 @@ extensionContext.subscriptions.push(
       return;
     }
 
+    // 1️⃣ Always load/create store
     const store = await loadSecretFile(ws);
 
-    // Mode must be selected
+    // 2️⃣ Mode must exist
     if (!store.data.mode) {
       openOnOpenWarning(ws);
       return;
     }
 
-    // 🔑 Resolve key
+    // 3️⃣ Resolve key
     let key;
     if (store.data.mode === "project") {
       await ensureProjectKey(ws);
       key = await getProjectKey(ws);
     } else {
-      // ✅ MACHINE MODE — SILENT
+      // ✅ MACHINE MODE → SILENT
       key = await getOrCreateMachineKey(extensionContext);
     }
 
@@ -1164,12 +1365,103 @@ extensionContext.subscriptions.push(
       return;
     }
 
-    // 👉 Continue scan normally (your existing scan logic stays)
-    // (no other changes needed here)
+    const files = await vscode.workspace.findFiles(
+      "**/*.{js,ts,jsx,tsx}",
+      "**/node_modules/**"
+    );
+
+    let updatedFiles = 0;
+    let detectedAny = false;
+
+    for (const file of files) {
+      if (shouldSkipScanFile(file)) continue;
+
+      const original = (await vscode.workspace.fs.readFile(file)).toString();
+      const lines = original.split("\n");
+      let changed = false;
+
+      for (let i = 0; i < lines.length; i++) {
+        const found = detect(lines[i]);
+        if (!found.length) continue;
+
+        for (const s of found) {
+          detectedAny = true;
+
+          const hash = hashValue(s.value);
+          const existing = store.data.secrets.find(e => e.hash === hash);
+
+          const placeholder =
+            existing?.placeholder ??
+            `<SECRET_${crypto.randomBytes(4).toString("hex").toUpperCase()}>`;
+
+          if (lines[i].includes("resolveSecret(")) continue;
+
+          const encrypted =
+            existing?.encrypted ?? encryptWithKey(key, s.value);
+
+          lines[i] = lines[i]
+            .replace(`"${s.value}"`, `resolveSecret("${placeholder}")`)
+            .replace(`'${s.value}'`, `resolveSecret("${placeholder}")`);
+
+          store.data.secrets.push({
+            id: crypto.randomBytes(4).toString("hex"),
+            type: s.type,
+            hash,
+            file: path.relative(ws.uri.fsPath, file.fsPath),
+            line: i + 1,
+            placeholder,
+            variable: s.variable,
+            encrypted,
+            disabled: false
+          });
+
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        if (!original.includes("@shielder/runtime")) {
+          lines.unshift(
+            'import { resolveSecret } from "@shielder/runtime";'
+          );
+        }
+
+       suspendAutoRestore(800);
+markInternalOp(file);
+await vscode.workspace.fs.writeFile(
+  file,
+  Buffer.from(lines.join("\n"))
+);
+unmarkInternalOp(file);
+
+
+        updatedFiles++;
+      }
+    }
+
+    if (!detectedAny) {
+      vscode.window.showInformationMessage("ℹ️ No secrets detected");
+      return;
+    }
+
+   suspendAutoRestore(800);
+markInternalOp(store.uri);
+await vscode.workspace.fs.writeFile(
+  store.uri,
+  Buffer.from(JSON.stringify(store.data, null, 2))
+);
+unmarkInternalOp(store.uri);
+
+
+
+    await writeRecoveryFile(ws, extensionContext);
+    updateShielderStatus(store.data.mode);
+
+    vscode.window.showInformationMessage(
+      `🔐 Secrets protected: ${updatedFiles} files updated`
+    );
   })
 );
-
-
 }
 
 
@@ -1185,8 +1477,13 @@ function openShielderIncidentWebview(type) {
   panel.webview.html = getShielderIncidentHTML(type);
 }
 
+let manageSecretsActive = false;
+
+
 
 function openManageSecrets(ws) {
+  manageSecretsActive = true;
+
   const panel = vscode.window.createWebviewPanel(
     "shielderManageSecrets",
     "Shielder — Manage Secrets",
@@ -1199,6 +1496,11 @@ function openManageSecrets(ws) {
   // ─────────────────────────────
   // 🔍 Helper: find current line dynamically
   // ─────────────────────────────
+
+  panel.onDidDispose(() => {
+  manageSecretsActive = false;
+});
+
 
 async function findCurrentLine(ws, secret) {
   try {
@@ -1307,102 +1609,142 @@ if (store.data.mode === "project") {
 
       s.encrypted = encryptWithKey(key, msg.value);
 
-      await vscode.workspace.fs.writeFile(
-        store.uri,
-        Buffer.from(JSON.stringify(store.data, null, 2))
-      );
+     suspendAutoRestore(800);
+markInternalOp(store.uri);
+await vscode.workspace.fs.writeFile(
+  store.uri,
+  Buffer.from(JSON.stringify(store.data, null, 2))
+);
+unmarkInternalOp(store.uri);
+
     }
 
     // ─────────────────────────────
     // 🔁 TOGGLE ENABLE / DISABLE
     // ─────────────────────────────
-    if (msg.type === "toggle") {
-      const s = store.data.secrets.find(x => x.id === msg.id);
-      if (!s) return;
+   if (msg.type === "toggle") {
+  const s = store.data.secrets.find(x => x.id === msg.id);
+  if (!s) return;
 
-      const fileUri = vscode.Uri.joinPath(ws.uri, s.file);
-      const lines = (await vscode.workspace.fs.readFile(fileUri))
-        .toString()
-        .split("\n");
+  const fileUri = vscode.Uri.joinPath(ws.uri, s.file);
+  let lines;
 
-      const target = `resolveSecret("${s.placeholder}")`;
+  try {
+    lines = (await vscode.workspace.fs.readFile(fileUri))
+      .toString()
+      .split("\n");
+  } catch {
+    vscode.window.showErrorMessage(`Cannot open ${s.file}`);
+    return;
+  }
 
-      // ───────── DISABLE ─────────
-      if (!s.disabled) {
-        const foundIndex = lines.findIndex(line =>
-          line.includes(target)
-        );
+  const placeholderCall = `resolveSecret("${s.placeholder}")`;
 
-        if (foundIndex === -1) {
-          vscode.window.showErrorMessage(
-            `Cannot disable: placeholder not found in ${s.file}`
-          );
-          return;
-        }
-
-        const plaintext = decryptWithKey(key, s.encrypted);
-
-        lines[foundIndex] = lines[foundIndex].replace(
-          target,
-          `"${plaintext}"`
-        );
-
-        s.disabled = true;
-      }
-
-      // ───────── ENABLE ─────────
-      else {
-        const plainIndex = lines.findIndex(line =>
-          line.includes(`"${decryptWithKey(key, s.encrypted)}"`)
-        );
-
-        if (plainIndex === -1) {
-          vscode.window.showErrorMessage(
-            `Cannot enable: plaintext not found in ${s.file}`
-          );
-          return;
-        }
-
-        const match = lines[plainIndex].match(/["']([^"']+)["']/);
-        if (!match) {
-          vscode.window.showErrorMessage(
-            `Cannot enable: plaintext parse failed in ${s.file}`
-          );
-          return;
-        }
-
-        const plaintext = match[1];
-        s.encrypted = encryptWithKey(key, plaintext);
-
-        lines[plainIndex] = lines[plainIndex].replace(
-          `"${plaintext}"`,
-          `resolveSecret("${s.placeholder}")`
-        );
-
-        s.disabled = false;
-      }
-
-      // ✍️ Write source file
-      await vscode.workspace.fs.writeFile(
-        fileUri,
-        Buffer.from(lines.join("\n"))
+  // ───────── DISABLE ─────────
+  if (!s.disabled) {
+    const idx = lines.findIndex(l => l.includes(placeholderCall));
+    if (idx === -1) {
+      vscode.window.showErrorMessage(
+        `Cannot disable: placeholder not found in ${s.file}`
       );
-
-      // 💾 Save store
-      await vscode.workspace.fs.writeFile(
-        store.uri,
-        Buffer.from(JSON.stringify(store.data, null, 2))
-      );
-
-      // 🔁 Re-render UI (same pipeline as load)
-      const secretsForUI = await buildSecretsForUI(ws, store);
-
-      panel.webview.postMessage({
-        type: "render",
-        secrets: secretsForUI
-      });
+      return;
     }
+
+    const plaintext = decryptWithKey(key, s.encrypted);
+
+    lines[idx] = lines[idx].replace(
+      placeholderCall,
+      `"${plaintext}"`
+    );
+
+    s.disabled = true;
+  }
+
+  // ───────── ENABLE ─────────
+  else {
+    const plaintext = decryptWithKey(key, s.encrypted);
+
+    const idx = lines.findIndex(l => l.includes(`"${plaintext}"`));
+    if (idx === -1) {
+      vscode.window.showErrorMessage(
+        `Cannot enable: plaintext not found in ${s.file}`
+      );
+      return;
+    }
+
+    lines[idx] = lines[idx].replace(
+      `"${plaintext}"`,
+      placeholderCall
+    );
+
+    s.disabled = false;
+  }
+
+  // ✍️ Write source file (trusted operation)
+  markInternalOp(fileUri);
+  await vscode.workspace.fs.writeFile(
+    fileUri,
+    Buffer.from(lines.join("\n"))
+  );
+  unmarkInternalOp(fileUri);
+
+  // 💾 Save store (trusted)
+  markInternalOp(store.uri);
+  await vscode.workspace.fs.writeFile(
+    store.uri,
+    Buffer.from(JSON.stringify(store.data, null, 2))
+  );
+  unmarkInternalOp(store.uri);
+
+  // 🔐 CRITICAL: Update recovery snapshot so auto-restore agrees
+  await writeRecoveryFile(ws, extensionContext);
+
+  // 🔁 Re-render UI
+  const secretsForUI = await buildSecretsForUI(ws, store);
+  panel.webview.postMessage({
+    type: "render",
+    secrets: secretsForUI
   });
+}
+
+  });
+}
+
+
+async function fullyRevertProtection(ws) {
+  // 🛑 Stop auto-restore during revert
+  suspendAutoRestore(2000);
+
+  const recoveryUri = vscode.Uri.joinPath(ws.uri, RECOVERY_FILE);
+  const keyUri = vscode.Uri.joinPath(ws.uri, PROJECT_KEY_FILE);
+  const storeUri = vscode.Uri.joinPath(ws.uri, SECRET_FILE);
+
+  // 1️⃣ Delete recovery FIRST
+  try {
+    markInternalOp(recoveryUri);
+    await vscode.workspace.fs.delete(recoveryUri);
+  } catch {}
+  finally {
+    unmarkInternalOp(recoveryUri);
+  }
+
+  // 2️⃣ Delete project key
+  try {
+    markInternalOp(keyUri);
+    await vscode.workspace.fs.delete(keyUri);
+  } catch {}
+  finally {
+    unmarkInternalOp(keyUri);
+  }
+
+  // 3️⃣ Delete secret store
+  try {
+    markInternalOp(storeUri);
+    await vscode.workspace.fs.delete(storeUri);
+  } catch {}
+  finally {
+    unmarkInternalOp(storeUri);
+  }
 }
 
 
@@ -2028,22 +2370,36 @@ async function handleWorkspaceOpen(extensionContext) {
   const ws = vscode.workspace.workspaceFolders?.[0];
   if (!ws) return;
 
+  // ─────────────────────────────
+  // 🔁 AUTO-VERIFY / RECOVERY
+  // ─────────────────────────────
+  const recoveryUri = vscode.Uri.joinPath(ws.uri, RECOVERY_FILE);
+
+  try {
+    await vscode.workspace.fs.stat(recoveryUri);
+    await verifyAndRestore(ws);
+  } catch {
+    // no recovery yet → continue normally
+  }
+
+  // ─────────────────────────────
+  // 🔔 NORMAL ONBOARDING FLOW
+  // ─────────────────────────────
   const store = await loadSecretFile(ws, { createIfMissing: false });
 
-  // Not protected yet → only show mode chooser
   if (!store || !store.data?.mode) {
     updateShielderStatus(null);
     openOnOpenWarning(ws);
     return;
   }
 
-  // ✅ MACHINE MODE → SILENT KEY ENSURE
   if (store.data.mode === "machine") {
     await getOrCreateMachineKey(extensionContext);
   }
 
   updateShielderStatus(store.data.mode);
 }
+
 
 
 
@@ -2097,6 +2453,7 @@ function openOnOpenWarning(ws, options = {}) {
       store.uri,
       Buffer.from(JSON.stringify(store.data, null, 2))
     );
+    
 updateShielderStatus("project");
     vscode.commands.executeCommand("shielder.scan");
     return;
@@ -2424,8 +2781,12 @@ function getOnOpenWarningHTML() {
 */
 
 async function revertProject(extensionContext, ws) {
+  // 🛑 Stop auto-restore during full revert
+  suspendAutoRestore(3000);
+
   const storeUri = vscode.Uri.joinPath(ws.uri, SECRET_FILE);
   const keyUri = vscode.Uri.joinPath(ws.uri, PROJECT_KEY_FILE);
+  const recoveryUri = vscode.Uri.joinPath(ws.uri, RECOVERY_FILE);
 
   let store;
 
@@ -2437,17 +2798,18 @@ async function revertProject(extensionContext, ws) {
     store = { secrets: [] };
   }
 
-  // 2️⃣ Load project key if present
-let key;
-const storeData = await loadSecretFile(ws);
-
-if (storeData.data.mode === "project") {
-  key = await getProjectKey(ws);
-} else {
-  key = await getOrCreateMachineKey(extensionContext);
-}
-
-
+  // 2️⃣ Load key (only if needed)
+  let key;
+  try {
+    const storeData = await loadSecretFile(ws, { createIfMissing: false });
+    if (storeData?.data?.mode === "project") {
+      key = await getProjectKey(ws);
+    } else if (storeData?.data?.mode === "machine") {
+      key = await getOrCreateMachineKey(extensionContext);
+    }
+  } catch {
+    key = null;
+  }
 
   // 3️⃣ Group secrets by file
   const secretsByFile = new Map();
@@ -2458,16 +2820,28 @@ if (storeData.data.mode === "project") {
     secretsByFile.get(s.file).push(s);
   }
 
-  // 4️⃣ Revert files
+  // 4️⃣ Revert all affected source files
   for (const [relativePath, secrets] of secretsByFile.entries()) {
     const fileUri = vscode.Uri.joinPath(ws.uri, relativePath);
-    let content = (await vscode.workspace.fs.readFile(fileUri)).toString();
+    let content;
 
-    // 4a️⃣ Replace known secrets
+    try {
+      content = (await vscode.workspace.fs.readFile(fileUri)).toString();
+    } catch {
+      continue;
+    }
+
+    // 4a️⃣ Replace known placeholders with plaintext
     for (const s of secrets) {
       if (!key) continue;
 
-      const plaintext = decryptWithKey(key, s.encrypted);
+      let plaintext;
+      try {
+        plaintext = decryptWithKey(key, s.encrypted);
+      } catch {
+        continue;
+      }
+
       const knownPattern = new RegExp(
         `resolveSecret\\s*\\(\\s*["']${s.placeholder}["']\\s*\\)`,
         "g"
@@ -2476,8 +2850,7 @@ if (storeData.data.mode === "project") {
       content = content.replace(knownPattern, `"${plaintext}"`);
     }
 
-    // 4b️⃣ 🔥 FINAL SAFETY NET
-    // Replace ANY remaining resolveSecret("<SECRET_...>")
+    // 4b️⃣ FINAL SAFETY NET — remove any unresolved placeholders
     content = content.replace(
       /resolveSecret\s*\(\s*["']<SECRET_[A-Z0-9]+>["']\s*\)/g,
       '""'
@@ -2491,34 +2864,52 @@ if (storeData.data.mode === "project") {
       );
     }
 
+    // 4d️⃣ Write reverted file safely
+    markInternalOp(fileUri);
     await vscode.workspace.fs.writeFile(
       fileUri,
       Buffer.from(content)
     );
+    unmarkInternalOp(fileUri);
   }
 
-  // 5️⃣ Mark internal deletes
-  markInternalOp(keyUri);
-  markInternalOp(storeUri);
+  // 5️⃣ Delete recovery FIRST (source of truth)
+  try {
+    markInternalOp(recoveryUri);
+    await vscode.workspace.fs.delete(recoveryUri);
+  } catch {}
+  finally {
+    unmarkInternalOp(recoveryUri);
+  }
 
-  // 6️⃣ Delete key + store
-  try { await vscode.workspace.fs.delete(keyUri); } catch {}
-  try { await vscode.workspace.fs.delete(storeUri); } catch {}
+  // 6️⃣ Delete project key
+  try {
+    markInternalOp(keyUri);
+    await vscode.workspace.fs.delete(keyUri);
+  } catch {}
+  finally {
+    unmarkInternalOp(keyUri);
+  }
 
-  // 7️⃣ Unmark
-  unmarkInternalOp(keyUri);
-  unmarkInternalOp(storeUri);
+  // 7️⃣ Delete secret store
+  try {
+    markInternalOp(storeUri);
+    await vscode.workspace.fs.delete(storeUri);
+  } catch {}
+  finally {
+    unmarkInternalOp(storeUri);
+  }
 
-  // 8️⃣ Close editors
+  // 8️⃣ Close all editors (avoid stale buffers)
   await vscode.commands.executeCommand("workbench.action.closeAllEditors");
 
-  // 9️⃣ Done
-  vscode.window.showInformationMessage(
-    "🔓 Shielder protection removed. All secrets restored or cleaned."
-  );
+  // 9️⃣ Final UI cleanup
   updateShielderStatus(null);
-
+  vscode.window.showInformationMessage(
+    "🔓 Shielder protection removed. All secrets restored and protection fully disabled."
+  );
 }
+
 
 
 
