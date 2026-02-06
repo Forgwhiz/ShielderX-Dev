@@ -854,17 +854,44 @@ function isWrappedStringLiteral(text) {
 
 let extensionContext;
 
-function updateShielderStatus(mode) {
+function updateShielderStatus(mode, owner) {
   if (!shielderStatusBar) return;
 
-  if (mode === "machine") {
-    shielderStatusBar.text = "🔐 Shielder: Machine Key";
-  } else if (mode === "project") {
-    shielderStatusBar.text = "🔐 Shielder: Project Key";
-  } else {
-    shielderStatusBar.text = "🔓 Shielder: Not Protected";
+  // 🔓 Not protected
+  if (!mode) {
+    shielderStatusBar.text = "🔓 Shielder: Not Protected(Recovery Owner: NA)";
+    shielderStatusBar.tooltip = "Project is not protected by Shielder";
+    return;
   }
+
+  // 🔐 Base text
+  let text =
+    mode === "machine"
+      ? "🔐 Shielder: Machine Key"
+      : "🔐 Shielder: Project Key";
+
+  // 👤 Owner info (only for project mode)
+  if (mode === "project" && owner?.user) {
+    text += ` (Recovery Owner: ${owner.user})`;
+
+    const claimedAt = owner.claimedAt
+      ? new Date(owner.claimedAt).toLocaleString()
+      : "Unknown time";
+
+    shielderStatusBar.tooltip =
+      `Recovery owner: ${owner.user}\n` +
+      `Host: ${owner.host || "Unknown"}\n` +
+      `Claimed at: ${claimedAt}`;
+  } else {
+    shielderStatusBar.tooltip =
+      mode === "machine"
+        ? "Secrets are protected using a machine-specific key"
+        : "Secrets are protected using a project key";
+  }
+
+  shielderStatusBar.text = text;
 }
+
 
 
 
@@ -1344,6 +1371,11 @@ extensionContext.subscriptions.push(
     // 1️⃣ Always load/create store
     const store = await loadSecretFile(ws);
 
+    if (!store.data.owner) {
+  store.data.owner = getCurrentActor();
+}
+
+
     // 2️⃣ Mode must exist
     if (!store.data.mode) {
       openOnOpenWarning(ws);
@@ -1455,13 +1487,25 @@ unmarkInternalOp(store.uri);
 
 
     await writeRecoveryFile(ws, extensionContext);
-    updateShielderStatus(store.data.mode);
+    updateShielderStatus(store.data.mode,  store.data.owner);
 
     vscode.window.showInformationMessage(
       `🔐 Secrets protected: ${updatedFiles} files updated`
     );
   })
 );
+}
+
+
+function getCurrentActor() {
+  const os = require("os");
+
+  return {
+    user: os.userInfo().username,
+    host: os.hostname(),
+    platform: process.platform,
+    claimedAt: new Date().toISOString()
+  };
 }
 
 
@@ -2388,7 +2432,7 @@ async function handleWorkspaceOpen(extensionContext) {
   const store = await loadSecretFile(ws, { createIfMissing: false });
 
   if (!store || !store.data?.mode) {
-    updateShielderStatus(null);
+    updateShielderStatus(null, null);
     openOnOpenWarning(ws);
     return;
   }
@@ -2397,7 +2441,7 @@ async function handleWorkspaceOpen(extensionContext) {
     await getOrCreateMachineKey(extensionContext);
   }
 
-  updateShielderStatus(store.data.mode);
+  updateShielderStatus(store.data.mode, store.data.owner);
 }
 
 
