@@ -157,6 +157,84 @@ async function generateProjectFingerprint(workspaceFolder) {
 }
 
 
+const PLATFORMS = [
+  {
+    id: "react-native",
+    supportsRuntime: true,
+    detect: async (ws) => await packageJsonHas(ws, "react-native")
+  },
+  {
+    id: "flutter",
+    supportsRuntime: true,
+    detect: async (ws) => await fileExists(ws, "pubspec.yaml")
+  },
+  { // JavaScript / TypeScript (frontend + Node backend)
+    id: "javascript",
+    supportsRuntime: true,
+    detect: async (ws) => await fileExists(ws, "package.json")
+  },
+  // Java
+  {
+    id: "java",
+    supportsRuntime: false,
+    detect: async (ws) =>
+      await fileExists(ws, "pom.xml") ||
+      await fileExists(ws, "build.gradle")
+  },
+
+  // Python
+  {
+    id: "python",
+    supportsRuntime: false,
+    detect: async (ws) =>
+      await fileExists(ws, "requirements.txt") ||
+      await fileExists(ws, "pyproject.toml")
+  },
+
+  // Go
+  {
+    id: "go",
+    supportsRuntime: false,
+    detect: async (ws) => await fileExists(ws, "go.mod")
+  },
+
+  // PHP
+  {
+    id: "php",
+    supportsRuntime: false,
+    detect: async (ws) => await fileExists(ws, "composer.json")
+  },
+
+  // C#
+  {
+    id: "dotnet",
+    supportsRuntime: false,
+    detect: async (ws) => await fileExists(ws, "*.csproj")
+  },
+  {
+    id: "backend",
+    supportsRuntime: false,
+    detect: async (ws) =>
+      await fileExists(ws, "pom.xml") ||
+      await fileExists(ws, "build.gradle") ||
+      await fileExists(ws, "requirements.txt") ||
+      await fileExists(ws, "go.mod") ||
+      await fileExists(ws, "composer.json") ||
+      await fileExists(ws, "*.csproj")
+  }
+];
+
+
+async function detectPlatform(ws) {
+  for (const p of PLATFORMS) {
+    if (await p.detect(ws)) return p;
+  }
+  return null;
+}
+
+
+
+
 /*********************************
  * KEY MANAGEMENT
  *********************************/
@@ -893,6 +971,117 @@ function updateShielderStatus(mode, owner) {
 }
 
 
+async function detectPackageManager(ws) {
+  const fs = vscode.workspace.fs;
+
+  const has = async (file) => {
+    try {
+      await fs.stat(vscode.Uri.joinPath(ws.uri, file));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  if (await has("yarn.lock")) return "yarn";
+  if (await has("pnpm-lock.yaml")) return "pnpm";
+  if (await has("package-lock.json")) return "npm";
+
+  return "npm"; // default fallback
+}
+
+async function ensureShielderRuntime(ws) {
+  const store = await loadSecretFile(ws);
+  const platform = await detectPlatform(ws);
+
+  if (!platform) return;
+
+  // 🚫 Backend platforms → NO runtime install
+ // 🚫 Platforms that REQUIRE a runtime SDK (not available yet)
+if (!platform.supportsRuntime) {
+  if (!store.data.backendNoticeShown) {
+    vscode.window.showInformationMessage(
+      `Shielder detected a ${platform.id.toUpperCase()} project.\n\n` +
+      `Runtime secret decryption for ${platform.id} requires a ` +
+      `platform-specific Shielder library, which is not available yet.\n\n` +
+      `Scan & protection will work, but secrets cannot be resolved at runtime.\n\n` +
+      `Support is coming soon.`,
+      { modal: true }
+    );
+
+    store.data.backendNoticeShown = true;
+
+    markInternalOp(store.uri);
+    await vscode.workspace.fs.writeFile(
+      store.uri,
+      Buffer.from(JSON.stringify(store.data, null, 2))
+    );
+    unmarkInternalOp(store.uri);
+  }
+
+  return; // ⛔ absolutely no auto install / import
+}
+
+
+  // ✅ Already installed → skip
+  if (
+    store.data.runtime &&
+    store.data.runtime.id === platform.id
+  ) {
+    return;
+  }
+
+  const pm = await detectPackageManager(ws);
+
+  if (platform.id === "react-native") {
+    await runInstall(pm, "@shielder/react-native-runtime");
+  } else if (platform.id === "flutter") {
+    await runCommand(ws, "flutter pub add shielder_runtime");
+  } else {
+    // JS / TS / frontend / Node backend
+    await runInstall(pm, "@shielder/runtime");
+  }
+
+  // 💾 Persist once → prevents repeat installs
+  store.data.runtime = {
+    id: platform.id,
+    installedAt: new Date().toISOString()
+  };
+
+  markInternalOp(store.uri);
+  await vscode.workspace.fs.writeFile(
+    store.uri,
+    Buffer.from(JSON.stringify(store.data, null, 2))
+  );
+  unmarkInternalOp(store.uri);
+}
+
+
+function openBackendDocs(platformId) {
+  vscode.env.openExternal(
+    vscode.Uri.parse(
+      `https://github.com/your-org/shielder/docs/backend/${platformId}.md`
+    )
+  );
+}
+
+
+
+
+async function runInstall(pm, pkg) {
+  const terminal = vscode.window.createTerminal("Shielder Setup");
+  terminal.show();
+
+  if (pm === "yarn") {
+    terminal.sendText(`yarn add ${pkg}`);
+  } else if (pm === "pnpm") {
+    terminal.sendText(`pnpm add ${pkg}`);
+  } else {
+    terminal.sendText(`npm install ${pkg}`);
+  }
+}
+
+
 
 
 function activate(context) {
@@ -1367,6 +1556,8 @@ extensionContext.subscriptions.push(
       vscode.window.showWarningMessage("⚠️ No workspace folder open.");
       return;
     }
+
+     await ensureShielderRuntime(ws);
 
     // 1️⃣ Always load/create store
     const store = await loadSecretFile(ws);
