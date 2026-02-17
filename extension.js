@@ -1604,7 +1604,7 @@ async function ensureShielderRuntime(ws, store) {
     await ensureShielderRuntimeBootstrap(ws);
   } 
   else if (platform.id === "flutter") {
-    await runCommand(ws, "flutter pub add shielder_runtime");
+    await runInstall(pm, "shielder_runtime"); // uses terminal like others
   } 
   else {
     // JS / TS / Web / Node
@@ -3836,12 +3836,15 @@ function getOnOpenWarningHTML() {
 
 
 async function runUninstall(pm, pkg) {
-  if (pm === "npm") {
-    await runCommand(ws, `npm uninstall ${pkg}`);
-  } else if (pm === "yarn") {
-    await runCommand(ws, `yarn remove ${pkg}`);
+  const terminal = vscode.window.createTerminal("Shielder Cleanup");
+  terminal.show();
+
+  if (pm === "yarn") {
+    terminal.sendText(`yarn remove ${pkg}`);
   } else if (pm === "pnpm") {
-    await runCommand(ws, `pnpm remove ${pkg}`);
+    terminal.sendText(`pnpm remove ${pkg}`);
+  } else {
+    terminal.sendText(`npm uninstall ${pkg}`);
   }
 }
 
@@ -3930,10 +3933,17 @@ async function revertProject(extensionContext, ws) {
         ""
       );
 
-       content = content.replace(
-    /import\s+["']\.\/shielderx\.runtime["'];?\s*\n?/g,
-    ""
-  );
+      // Remove old runtime import name
+      content = content.replace(
+        /import\s+["']\.\/shielderx\.runtime["'];?\s*\n?/g,
+        ""
+      );
+
+      // Remove new hidden runtime import name
+      content = content.replace(
+        /import\s+["']\.\/\.shielderx\.runtime["'];?\s*\n?/g,
+        ""
+      );
     }
 
     // 4d️⃣ Write reverted file safely
@@ -3980,15 +3990,17 @@ async function revertProject(extensionContext, ws) {
   const pm = await detectPackageManager(ws);
 
  if (platform?.id === "react-native") {
-  // 1️⃣ Remove generated bootstrap file
-  const runtimeFile = vscode.Uri.joinPath(ws.uri, "shielderx.runtime.js");
-  const metroFile = vscode.Uri.joinPath(ws.uri, "metro.config.js");
-  try {
-    await vscode.workspace.fs.delete(runtimeFile);
-     await vscode.workspace.fs.delete(metroFile);
-  } catch {}
+  // Remove ALL generated bootstrap files (old and new names)
+  const runtimeFiles = [
+    vscode.Uri.joinPath(ws.uri, "shielderx.runtime.js"),
+    vscode.Uri.joinPath(ws.uri, ".shielderx.runtime.js"),
+    vscode.Uri.joinPath(ws.uri, "metro.config.js")
+  ];
+  for (const f of runtimeFiles) {
+    try { await vscode.workspace.fs.delete(f); } catch {}
+  }
 
-  // 2️⃣ Uninstall RN runtime package
+  // Uninstall RN runtime package
   await runUninstall(pm, "@shielderx/react-native-runtime");
 }
 
@@ -3996,13 +4008,14 @@ if (platform?.supportsRuntime && platform?.id !== "react-native") {
   await runUninstall(pm, "@shielderx/runtime");
 }
 
-  // 🔥 Remove generated RN bootstrap file
-  const runtimeFile = vscode.Uri.joinPath(ws.uri, "shielderx.runtime.js");
+  // ✅ FIX: Clear globalState recovery backup on revert
   try {
-    await vscode.workspace.fs.delete(runtimeFile);
-  } catch {
-    // ignore if not exists
-  }
+    const fingerprint = await generateProjectFingerprint(ws);
+    const recoveryStorageKey = `shielderx-recovery-${fingerprint.slice(0, 16)}`;
+    const keyStorageKey = `shielderx-key-${fingerprint.slice(0, 16)}`;
+    await extensionContext.globalState.update(recoveryStorageKey, undefined);
+    await extensionContext.globalState.update(keyStorageKey, undefined);
+  } catch {}
 
   // 🔚 Final UI cleanup
   updateShielderStatus(null);
