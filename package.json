@@ -13,43 +13,48 @@
     "color": "#1e1e1e",
     "theme": "dark"
   },
-  "activationEvents": ["onStartupFinished"],
-"main": "./extension.js",
-"contributes": {
-  "commands": [
-    {
-      "command": "shielder.scan",
-      "title": "ShielderX: Scan Project"
-    },
-     {
-      "command": "shielder.manageSecrets",
-      "title": "ShielderX: Manage Secrets"
-    },
-    {
-      "command": "shielder.exportKey",
-      "title": "ShielderX: Export Project Key"
-    },
-    {
-      "command": "shielder.rotateKey",
-      "title": "ShielderX: Rotate Project Key"
-    },
-    {
-      "command": "shielder.revertProject",
-      "title": "ShielderX: Revert Project"
-    },
-    {
-      "command": "shielder.showProtectionInfo",
-      "title": "ShielderX: Protection Key Info"
-    }
-    
-  ]
-},
- "categories": [
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "shielder.scan",
+        "title": "ShielderX: Scan Project"
+      },
+      {
+        "command": "shielder.manageSecrets",
+        "title": "ShielderX: Manage Secrets"
+      },
+      {
+        "command": "shielder.exportKey",
+        "title": "ShielderX: Export Project Key"
+      },
+      {
+        "command": "shielder.rotateKey",
+        "title": "ShielderX: Rotate Project Key"
+      },
+      {
+        "command": "shielder.revertProject",
+        "title": "ShielderX: Revert Project"
+      },
+      {
+        "command": "shielder.showProtectionInfo",
+        "title": "ShielderX: Protection Key Info"
+      },
+      {
+     "command": "shielder.generateRecovery",
+     "title": "ShielderX: Generate Recovery",
+    "category": "ShielderX"
+      }
+    ]
+  },
+  "categories": [
     "Programming Languages",
     "AI",
     "Other"
   ],
-
   "keywords": [
     "AI",
     "security",
@@ -69,5 +74,8 @@
     "AI-security",
     "secret-detection",
     "secret-protection"
-  ]
+  ],
+  "dependencies": {
+    "crypto-js": "^4.2.0"
+  }
 }

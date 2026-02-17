@@ -1,7 +1,10 @@
 {
-  "name": "@shielder/runtime",
-  "version": "0.1.0",
+  "name": "@shielderx/runtime",
+  "version": "0.0.1",
   "main": "src/index.js",
   "type": "commonjs",
+  "description": "Shielder runtime decryption for JS / Node / Web",
+  "keywords": ["shielder", "secrets", "runtime", "security"],
+  "author": "ShielderX",
   "license": "MIT"
 }

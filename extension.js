@@ -22,6 +22,8 @@ const SECRET_FILE = ".ai-secret-guard.json";
 
 const RECOVERY_FILE = ".shielder.recovery";
 
+const RUNTIME_FILE = "shielderx.runtime.js";
+const METRO_CONFIG_FILE = "metro.config.js";
 
 /*********************************
  * REGEX RULES
@@ -50,6 +52,9 @@ const HARD_EXCLUDED_FILES = new Set([
   "composer.json",
   "podfile.lock",
   "Podfile.lock",
+   "README.md",
+   "shielderx.runtime.js",
+   "metro.config.js",
   "Info.plist" // optional: iOS metadata
 ]);
 
@@ -59,7 +64,9 @@ const HARD_EXCLUDED_FILES = new Set([
 const SHIELDER_INTERNAL_FILES = new Set([
   PROJECT_KEY_FILE, // .shielder.key
   SECRET_FILE,  // .ai-secret-guard.json
-  RECOVERY_FILE          
+  RECOVERY_FILE   ,
+  RUNTIME_FILE,
+  METRO_CONFIG_FILE       
 ]);
 
 /*********************************
@@ -114,20 +121,20 @@ function isLikelyKey(value) {
 
 
 function shouldSkipScanFile(uri) {
-  const fileName = uri.fsPath.split("/").pop();
+  const fsPath = uri.fsPath;
+  const fileName = path.basename(fsPath);
 
-  // 🚫 Skip Shielder internal files
-  if (SHIELDER_INTERNAL_FILES.has(fileName)) {
+  // 🚫 Skip dot folders anywhere (.git, .vscode, .expo, etc.)
+  if (fsPath.includes(`${path.sep}.`)) {
     return true;
   }
 
-  // 🚫 Skip hard-excluded project metadata files
-  if (HARD_EXCLUDED_FILES.has(fileName)) {
-    return true;
-  }
+  if (SHIELDER_INTERNAL_FILES.has(fileName)) return true;
+  if (HARD_EXCLUDED_FILES.has(fileName)) return true;
 
   return false;
 }
+
 
 
 async function generateProjectFingerprint(workspaceFolder) {
@@ -156,23 +163,43 @@ async function generateProjectFingerprint(workspaceFolder) {
   return crypto.createHash("sha256").update(raw).digest("hex");
 }
 
+async function packageJsonHas(ws, pkgName) {
+  try {
+    const pkgUri = vscode.Uri.joinPath(ws.uri, "package.json");
+    const raw = await vscode.workspace.fs.readFile(pkgUri);
+    const pkg = JSON.parse(raw.toString());
+
+    return Boolean(
+      (pkg.dependencies && pkg.dependencies[pkgName]) ||
+      (pkg.devDependencies && pkg.devDependencies[pkgName])
+    );
+  } catch {
+    return false;
+  }
+}
+
+
+
 
 const PLATFORMS = [
-  {
-    id: "react-native",
-    supportsRuntime: true,
-    detect: async (ws) => await packageJsonHas(ws, "react-native")
-  },
+ {
+  id: "react-native",
+  supportsRuntime: true,
+  detect: async (ws) =>
+    (await packageJsonHas(ws, "react-native")) ||
+    (await packageJsonHas(ws, "expo")) ||
+    (await isExpoProject(ws)) ||              // ✅ REQUIRED
+    (await fileExists(ws, "app.json")) ||
+    (await fileExists(ws, "expo-env.d.ts")) ||
+    (await fileExists(ws, "ios")) ||
+    (await fileExists(ws, "android"))
+},
   {
     id: "flutter",
     supportsRuntime: true,
     detect: async (ws) => await fileExists(ws, "pubspec.yaml")
   },
-  { // JavaScript / TypeScript (frontend + Node backend)
-    id: "javascript",
-    supportsRuntime: true,
-    detect: async (ws) => await fileExists(ws, "package.json")
-  },
+ 
   // Java
   {
     id: "java",
@@ -221,7 +248,12 @@ const PLATFORMS = [
       await fileExists(ws, "go.mod") ||
       await fileExists(ws, "composer.json") ||
       await fileExists(ws, "*.csproj")
-  }
+  },
+   { // JavaScript / TypeScript (frontend + Node backend)
+    id: "javascript",
+    supportsRuntime: true,
+    detect: async (ws) => await fileExists(ws, "package.json")
+  },
 ];
 
 
@@ -232,6 +264,21 @@ async function detectPlatform(ws) {
   return null;
 }
 
+
+
+function getRuntimeImport(platform) {
+  if (!platform) return null;
+
+  if (platform.id === "react-native") {
+    return '@shielderx/react-native-runtime';
+  }
+
+  if (platform.supportsRuntime) {
+    return '@shielderx/runtime';
+  }
+
+  return null;
+}
 
 
 
@@ -252,30 +299,278 @@ async function detectPlatform(ws) {
 //   }
 // }
 
+async function isProjectAlreadyProtected(ws) {
+  // Check if any source file has resolveSecret() calls
+  // This survives even if ALL ShielderX files are deleted
+  try {
+    const files = await vscode.workspace.findFiles(
+      "**/*.{js,ts,jsx,tsx}",
+      "{**/node_modules/**,**/.vscode/**,**/.expo/**}",
+      20 // only check first 20 files for speed
+    );
+
+    for (const file of files) {
+      if (shouldSkipScanFile(file)) continue;
+      const content = (await vscode.workspace.fs.readFile(file)).toString();
+      if (/<SECRET_[A-Z0-9]+>/.test(content)) {
+        return true; // Found a placeholder → project IS protected
+      }
+    }
+  } catch {}
+
+  return false;
+}
+
 // New logic 
-async function ensureProjectKey(workspaceFolder) {
+async function ensureProjectKey(workspaceFolder, extensionContext) {
   const uri = vscode.Uri.joinPath(workspaceFolder.uri, PROJECT_KEY_FILE);
 
   try {
-    // If file exists, do nothing
     await vscode.workspace.fs.readFile(uri);
-    vscode.window.showInformationMessage("🔑 Project key already exists");
-    return;
+    return; // Key exists, nothing to do
   } catch {
-    // Generate strong random key
+    // Key doesn't exist - this machine is creating it = OWNER
     const key = crypto.randomBytes(32);
-
-    // Add a binary header so editors don't treat it as text
     const header = Buffer.from("SHIELDER_KEY_v1\n", "utf8");
     const payload = Buffer.concat([header, key]);
 
+    // Save to project file
     await vscode.workspace.fs.writeFile(uri, payload);
 
+    // ✅ Save to globalState (OWNER ONLY - only runs on first creation)
+    await saveKeyToGlobalState(workspaceFolder, key, extensionContext);
+
     vscode.window.showWarningMessage(
-      "🔐 Project key generated. Backup `.shielder.key`. Losing it = losing secrets."
+      "🔐 Project key generated. You are the recovery owner."
     );
   }
 }
+
+async function saveKeyToGlobalState(ws, key, extensionContext) {
+  try {
+    const fingerprint = await generateProjectFingerprint(ws);
+
+    // Get project name
+    let projectName = path.basename(ws.uri.fsPath);
+    try {
+      const pkg = JSON.parse(
+        (await vscode.workspace.fs.readFile(
+          vscode.Uri.joinPath(ws.uri, "package.json")
+        )).toString()
+      );
+      projectName = pkg.name || projectName;
+    } catch {}
+
+    // Storage key is unique per project
+    const storageKey = `shielderx-key-${fingerprint.slice(0, 16)}`;
+
+    const storageValue = JSON.stringify({
+      key: key.toString("base64"),
+      project: projectName,
+      projectPath: ws.uri.fsPath,
+      owner: {
+        user: require("os").userInfo().username,
+        host: require("os").hostname(),
+        savedAt: new Date().toISOString()
+      }
+    });
+
+    await extensionContext.globalState.update(storageKey, storageValue);
+    console.log(`[ShielderX] Key backed up as owner: ${storageKey}`);
+  } catch (e) {
+    console.warn("[ShielderX] Could not save to globalState:", e.message);
+  }
+}
+
+async function isOwner(ws, extensionContext) {
+  const fingerprint = await generateProjectFingerprint(ws);
+  const storageKey = `shielderx-key-${fingerprint.slice(0, 16)}`;
+  const stored = extensionContext.globalState.get(storageKey);
+  return !!stored;
+}
+
+
+async function getKeyFromGlobalState(ws, extensionContext) {
+  const fingerprint = await generateProjectFingerprint(ws);
+  const storageKey = `shielderx-key-${fingerprint.slice(0, 16)}`;
+  const stored = extensionContext.globalState.get(storageKey);
+  if (!stored) return null;
+
+  try {
+    const parsed = JSON.parse(stored);
+    return Buffer.from(parsed.key, "base64");
+  } catch {
+    return null;
+  }
+}
+
+async function generateRecovery(ws, extensionContext) {
+
+  const hasKey      = await fileExists(ws, PROJECT_KEY_FILE);
+  const hasStore    = await fileExists(ws, SECRET_FILE);
+  const hasRuntime  = await fileExists(ws, RUNTIME_FILE);
+  const hasMetro    = await fileExists(ws, METRO_CONFIG_FILE);
+  const hasRecovery = await fileExists(ws, RECOVERY_FILE);
+
+  const missing = [
+    !hasKey      && ".shielder.key",
+    !hasStore    && ".ai-secret-guard.json",
+    !hasRuntime  && RUNTIME_FILE,
+    !hasMetro    && METRO_CONFIG_FILE,
+    !hasRecovery && ".shielder.recovery"
+  ].filter(Boolean);
+
+  // ─────────────────────────────────────────────
+  // CASE 1: Nothing missing → just refresh recovery
+  // ─────────────────────────────────────────────
+  if (missing.length === 0) {
+    await writeRecoveryFile(ws, extensionContext);
+    vscode.window.showInformationMessage("✅ ShielderX: Recovery file refreshed!");
+    return;
+  }
+
+  // ─────────────────────────────────────────────
+  // CASE 2: Key exists → rebuild missing files
+  // ─────────────────────────────────────────────
+  if (hasKey) {
+    const confirm = await vscode.window.showWarningMessage(
+      `⚠️ ShielderX: ${missing.length} file(s) missing!\n\n` +
+      `${missing.map(f => `• ${f}`).join('\n')}\n\n` +
+      `Key found. Regenerate missing files?`,
+      { modal: true },
+      "Regenerate",
+      "Cancel"
+    );
+    if (confirm !== "Regenerate") return;
+
+    await rebuildMissingFiles(ws, extensionContext, {
+      hasStore, hasRuntime, hasMetro, hasRecovery
+    });
+    return;
+  }
+
+  // ─────────────────────────────────────────────
+  // CASE 3: Key missing → check if owner
+  // ─────────────────────────────────────────────
+  const ownerKey = await getKeyFromGlobalState(ws, extensionContext);
+
+  if (ownerKey) {
+    const confirm = await vscode.window.showWarningMessage(
+      `⚠️ ShielderX: Files missing!\n\n` +
+      `${missing.map(f => `• ${f}`).join('\n')}\n\n` +
+      `You are the recovery owner. Restore all files?`,
+      { modal: true },
+      "Restore All",
+      "Cancel"
+    );
+    if (confirm !== "Restore All") return;
+
+    await vscode.window.withProgress({
+      location: vscode.ProgressLocation.Notification,
+      title: "ShielderX: Restoring files...",
+      cancellable: false
+    }, async (progress) => {
+
+      // 1. Restore key file first
+      progress.report({ message: "Restoring .shielder.key...", increment: 15 });
+      const keyUri = vscode.Uri.joinPath(ws.uri, PROJECT_KEY_FILE);
+      markInternalOp(keyUri);
+      await vscode.workspace.fs.writeFile(keyUri, Buffer.concat([
+        Buffer.from("SHIELDER_KEY_v1\n"),
+        ownerKey
+      ]));
+      unmarkInternalOp(keyUri);
+
+      // 2. Rebuild all other missing files
+      await rebuildMissingFiles(ws, extensionContext, {
+        hasStore, hasRuntime, hasMetro, hasRecovery
+      }, progress);
+    });
+
+    // vscode.window.showInformationMessage(
+    //   `✅ ShielderX: All files restored!\n\nPush to Git so teammates can pull.`,
+    //   { modal: true },
+    //   "OK"
+    // );
+
+  } else {
+    // Not owner - get owner info from store if available
+    let ownerInfo = "the developer who ran the first scan";
+    if (hasStore) {
+      try {
+        const existingStore = await loadSecretFile(ws, { createIfMissing: false });
+        if (existingStore?.data?.owner?.user) {
+          ownerInfo = `${existingStore.data.owner.user} on ${existingStore.data.owner.host}`;
+        }
+      } catch {}
+    }
+
+    vscode.window.showErrorMessage(
+      `❌ ShielderX: Cannot recover on this machine.\n\n` +
+      `This machine is not the recovery owner.\n\n` +
+      `Ask ${ownerInfo} to:\n` +
+      `1. Run "ShielderX: Generate Recovery"\n` +
+      `2. Push the restored files\n\n` +
+      `Then pull the changes here.`,
+      { modal: true },
+      "OK"
+    );
+  }
+}
+
+
+async function rebuildMissingFiles(ws, extensionContext, state, progress) {
+  const { hasStore, hasRuntime, hasMetro, hasRecovery } = state;
+
+  if (!hasStore) {
+    progress?.report({ message: "Restoring .ai-secret-guard.json...", increment: 20 });
+
+    const fingerprint = await generateProjectFingerprint(ws);
+
+    // ✅ FIX: Load existing store first if it somehow partially exists
+    // otherwise build fresh one with owner from getCurrentActor()
+    let existingOwner = null;
+    try {
+      const existing = await loadSecretFile(ws, { createIfMissing: false });
+      existingOwner = existing?.data?.owner || null;
+    } catch {}
+
+    const freshStore = {
+      version: 2,
+      mode: "project",
+      fingerprint,
+      secrets: [],
+      owner: existingOwner || getCurrentActor()  // ✅ FIXED
+    };
+
+    const storeUri = vscode.Uri.joinPath(ws.uri, SECRET_FILE);
+    markInternalOp(storeUri);
+    await vscode.workspace.fs.writeFile(
+      storeUri,
+      Buffer.from(JSON.stringify(freshStore, null, 2))
+    );
+    unmarkInternalOp(storeUri);
+  }
+
+  if (!hasRuntime) {
+    progress?.report({ message: "Restoring runtime file...", increment: 20 });
+    await ensureShielderRuntimeBootstrap(ws, extensionContext);
+  }
+
+  if (!hasMetro) {
+    progress?.report({ message: "Restoring metro.config.js...", increment: 20 });
+    await ensureMetroConfig(ws);
+  }
+
+  progress?.report({ message: "Writing .shielder.recovery...", increment: 20 });
+  await writeRecoveryFile(ws, extensionContext);
+
+  vscode.window.showInformationMessage(
+    `✅ ShielderX: All files restored!\n\nRun: npm start -- --reset-cache`
+  );
+}
+
+
 
 async function writeRecoveryFile(ws, extensionContext) {
   const key = await getProjectKey(ws);
@@ -287,88 +582,138 @@ async function writeRecoveryFile(ws, extensionContext) {
       vscode.Uri.joinPath(ws.uri, PROJECT_KEY_FILE)
     )
   );
+  const storeHash = sha256(Buffer.from(JSON.stringify(store.data)));
 
-  const storeHash = sha256(
-    Buffer.from(JSON.stringify(store.data))
-  );
+  let runtimeContent = null;
+  let metroContent = null;
+  try {
+    runtimeContent = (await vscode.workspace.fs.readFile(
+      vscode.Uri.joinPath(ws.uri, RUNTIME_FILE)
+    )).toString();
+  } catch {}
+  try {
+    metroContent = (await vscode.workspace.fs.readFile(
+      vscode.Uri.joinPath(ws.uri, METRO_CONFIG_FILE)
+    )).toString();
+  } catch {}
 
   const payload = JSON.stringify({
     projectKey: key.toString("base64"),
     store: store.data,
-    hashes: { key: keyHash, store: storeHash }
+    hashes: { key: keyHash, store: storeHash },
+    runtimeContent,
+    metroContent
   });
 
   const fingerprint = await generateProjectFingerprint(ws);
-  const masterKey = crypto.scryptSync(
-    fingerprint,
-    "shielder-recovery",
-    32
-  );
-
+  const masterKey = crypto.scryptSync(fingerprint, "shielder-recovery", 32);
   const encrypted = encryptWithKey(masterKey, payload);
 
+  const fileContent = JSON.stringify({ version: 2, encrypted }, null, 2);
+
+  // ── Write to project file ──
   const recoveryUri = vscode.Uri.joinPath(ws.uri, RECOVERY_FILE);
   markInternalOp(recoveryUri);
-
-  await vscode.workspace.fs.writeFile(
-    recoveryUri,
-    Buffer.from(JSON.stringify({ version: 1, encrypted }, null, 2))
-  );
-
+  await vscode.workspace.fs.writeFile(recoveryUri, Buffer.from(fileContent));
   unmarkInternalOp(recoveryUri);
+
+  // ✅ NEW: ALSO save copy + hash to globalState
+  if (extensionContext) {
+    try {
+      const recoveryHash = sha256(Buffer.from(fileContent));
+      const storageKey = `shielderx-recovery-${fingerprint.slice(0, 16)}`;
+
+      await extensionContext.globalState.update(storageKey, JSON.stringify({
+        content: fileContent,        // Full recovery content
+        hash: recoveryHash,          // Hash for tamper detection
+        savedAt: new Date().toISOString()
+      }));
+    } catch (e) {
+      console.warn("[ShielderX] Could not save recovery to globalState:", e.message);
+    }
+  }
 }
+
 
 async function restoreFromRecovery(ws) {
   suspendAutoRestore(800);
 
   const recoveryUri = vscode.Uri.joinPath(ws.uri, RECOVERY_FILE);
 
-  const raw = JSON.parse(
-    (await vscode.workspace.fs.readFile(recoveryUri)).toString()
-  );
+  // ✅ FIX 1: Safe read with null check
+  let raw;
+  try {
+    const content = (await vscode.workspace.fs.readFile(recoveryUri)).toString();
+    if (!content || !content.trim()) return; // Empty file - nothing to restore
+    raw = JSON.parse(content);
+  } catch {
+    return; // Corrupted or missing - silently skip
+  }
 
-  const fingerprint = await generateProjectFingerprint(ws);
-  const masterKey = crypto.scryptSync(
-    fingerprint,
-    "shielder-recovery",
-    32
-  );
+  if (!raw?.encrypted) return; // No encrypted data
 
-  const decrypted = decryptWithKey(masterKey, raw.encrypted);
-  const snapshot = JSON.parse(decrypted);
+  let snapshot;
+  try {
+    const fingerprint = await generateProjectFingerprint(ws);
+    const masterKey = crypto.scryptSync(fingerprint, "shielder-recovery", 32);
+    const decrypted = decryptWithKey(masterKey, raw.encrypted);
+    snapshot = JSON.parse(decrypted);
+  } catch {
+    return; // Cannot decrypt
+  }
 
-  // Restore key
-  const keyUri = vscode.Uri.joinPath(ws.uri, PROJECT_KEY_FILE);
-  markInternalOp(keyUri);
-  await vscode.workspace.fs.writeFile(
-    keyUri,
-    Buffer.concat([
-      Buffer.from("SHIELDER_KEY_v1\n"),
-      Buffer.from(snapshot.projectKey, "base64")
-    ])
-  );
-  unmarkInternalOp(keyUri);
+  if (!snapshot) return;
 
-  // Restore store
-  const storeUri = vscode.Uri.joinPath(ws.uri, SECRET_FILE);
-  markInternalOp(storeUri);
-  await vscode.workspace.fs.writeFile(
-    storeUri,
-    Buffer.from(JSON.stringify(snapshot.store, null, 2))
-  );
-  unmarkInternalOp(storeUri);
+  // ✅ FIX 3: Restore key
+  if (snapshot.projectKey) {
+    const keyUri = vscode.Uri.joinPath(ws.uri, PROJECT_KEY_FILE);
+    markInternalOp(keyUri);
+    await vscode.workspace.fs.writeFile(
+      keyUri,
+      Buffer.concat([
+        Buffer.from("SHIELDER_KEY_v1\n"),
+        Buffer.from(snapshot.projectKey, "base64")
+      ])
+    );
+    unmarkInternalOp(keyUri);
+  }
+
+  // ✅ FIX 3: Restore store
+  if (snapshot.store) {
+    const storeUri = vscode.Uri.joinPath(ws.uri, SECRET_FILE);
+    markInternalOp(storeUri);
+    await vscode.workspace.fs.writeFile(
+      storeUri,
+      Buffer.from(JSON.stringify(snapshot.store, null, 2))
+    );
+    unmarkInternalOp(storeUri);
+  }
+
+  // ✅ FIX 3: Restore runtime file
+  if (snapshot.runtimeContent) {
+    const runtimeUri = vscode.Uri.joinPath(ws.uri, RUNTIME_FILE);
+    markInternalOp(runtimeUri);
+    await vscode.workspace.fs.writeFile(
+      runtimeUri,
+      Buffer.from(snapshot.runtimeContent)
+    );
+    unmarkInternalOp(runtimeUri);
+  }
+
+  // ✅ FIX 3: Restore metro config
+  if (snapshot.metroContent) {
+    const metroUri = vscode.Uri.joinPath(ws.uri, METRO_CONFIG_FILE);
+    markInternalOp(metroUri);
+    await vscode.workspace.fs.writeFile(
+      metroUri,
+      Buffer.from(snapshot.metroContent)
+    );
+    unmarkInternalOp(metroUri);
+  }
+
+  // Re-write recovery file
   await writeRecoveryFile(ws, extensionContext);
-
 }
-
-
-// async function getProjectKey(workspaceFolder) {
-//   return Buffer.from(
-//     await vscode.workspace.fs.readFile(
-//       vscode.Uri.joinPath(workspaceFolder.uri, PROJECT_KEY_FILE)
-//     )
-//   );
-// }
 
 
 
@@ -391,35 +736,60 @@ async function getProjectKey(workspaceFolder) {
 /*********************************
  * ENCRYPT / DECRYPT HELPERS
  *********************************/
-function encryptWithKey(key, value) {
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
 
-  const encrypted = Buffer.concat([
-    cipher.update(value, "utf8"),
-    cipher.final()
-  ]);
+// extension.js (inside the extension process)
+const CryptoJS = require("crypto-js");
 
-  return {
-    iv: iv.toString("hex"),
-    data: encrypted.toString("hex"),
-    tag: cipher.getAuthTag().toString("hex")
-  };
+// helper: convert a Node Buffer -> CryptoJS WordArray
+function wordArrayFromBuffer(buf) {
+  // CryptoJS accepts typed arrays; create WordArray from bytes
+  const words = [];
+  for (let i = 0; i < buf.length; i += 4) {
+    words.push(
+      ((buf[i] || 0) << 24) |
+      ((buf[i + 1] || 0) << 16) |
+      ((buf[i + 2] || 0) << 8) |
+      ((buf[i + 3] || 0))
+    );
+  }
+  return CryptoJS.lib.WordArray.create(words, buf.length);
 }
+
+function encryptWithKey(keyBuffer, plaintext) {
+  // keyBuffer is the 32-byte Buffer returned by getProjectKey(...)
+  const keyWA = wordArrayFromBuffer(keyBuffer);
+
+  const ivWA = CryptoJS.lib.WordArray.random(16); // 16 bytes IV
+  const encrypted = CryptoJS.AES.encrypt(
+    plaintext,
+    keyWA,
+    { iv: ivWA, mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7 }
+  );
+
+  // ciphertext as raw WordArray -> base64
+  const ciphertextBase64 = CryptoJS.enc.Base64.stringify(encrypted.ciphertext);
+  const ivBase64 = CryptoJS.enc.Base64.stringify(ivWA);
+
+  return { iv: ivBase64, data: ciphertextBase64 };
+}
+
 
 function decryptWithKey(key, payload) {
-  const decipher = crypto.createDecipheriv(
-    ALGORITHM,
-    key,
-    Buffer.from(payload.iv, "hex")
-  );
-  decipher.setAuthTag(Buffer.from(payload.tag, "hex"));
+  const iv = Buffer.from(payload.iv, "base64");
+  const data = Buffer.from(payload.data, "base64");
 
-  return Buffer.concat([
-    decipher.update(Buffer.from(payload.data, "hex")),
+  const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
+
+  const decrypted = Buffer.concat([
+    decipher.update(data),
     decipher.final()
-  ]).toString("utf8");
+  ]);
+
+  return decrypted.toString("utf8");
 }
+
+
+
 
 function hashValue(v) {
   return crypto.createHash("sha256").update(v).digest("hex");
@@ -489,7 +859,7 @@ async function isRuntimeInstalled(ws) {
     const pkgText = (await vscode.workspace.fs.readFile(pkgUri)).toString();
     const pkg = JSON.parse(pkgText);
     const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-    return !!deps["@shielder/runtime"];
+    return !!deps["@shielderx/runtime"];
   } catch {
     return false;
   }
@@ -508,9 +878,9 @@ function openInstallRuntimeWebview(ws) {
   <!doctype html>
   <html>
     <body style="font-family: system-ui, -apple-system; padding:20px;">
-      <h2>Install @shielder/runtime</h2>
-      <p>This project doesn't include <code>@shielder/runtime</code>. To enable runtime resolution (resolveSecret) install the package and try again.</p>
-      <p>Run <code>npm install @shielder/runtime</code> or add it to your project dependencies.</p>
+      <h2>Install @shielderx/runtime</h2>
+      <p>This project doesn't include <code>@shielderx/runtime</code>. To enable runtime resolution (resolveSecret) install the package and try again.</p>
+      <p>Run <code>npm install @shielderx/runtime</code> or add it to your project dependencies.</p>
       <div style="margin-top:18px;">
         <button onclick="install()">I installed it</button>
         <button onclick="close()">Close</button>
@@ -651,6 +1021,99 @@ function suspendAutoRestore(ms = 500) {
  * EXTENSION
  *********************************/
 
+// function setupProtectionWatchers(extensionContext) {
+//   const ws = vscode.workspace.workspaceFolders?.[0];
+//   if (!ws) return;
+
+// const keyWatcher = vscode.workspace.createFileSystemWatcher(
+//     new vscode.RelativePattern(ws, PROJECT_KEY_FILE)
+//   );
+
+//     const recoveryWatcher = vscode.workspace.createFileSystemWatcher(
+//     new vscode.RelativePattern(ws, RECOVERY_FILE)
+//   );
+
+//   const storeWatcher = vscode.workspace.createFileSystemWatcher(
+//     new vscode.RelativePattern(ws, SECRET_FILE)
+//   );
+
+//   // ✅ NEW: Watch runtime file
+//   const runtimeWatcher = vscode.workspace.createFileSystemWatcher(
+//     new vscode.RelativePattern(ws, RUNTIME_FILE)
+//   );
+
+//   // ✅ NEW: Watch metro config
+//   const metroWatcher = vscode.workspace.createFileSystemWatcher(
+//     new vscode.RelativePattern(ws, METRO_CONFIG_FILE)
+//   );
+
+//   const delayedVerify = async () => {
+//     await new Promise(r => setTimeout(r, 50));
+//     await verifyAndRestore(ws);
+//   };
+
+//   // Edits → restore from recovery
+//   keyWatcher.onDidChange(uri => {
+//     if (isInternalOp(uri)) return;
+//     delayedVerify();
+//   });
+
+//   storeWatcher.onDidChange(uri => {
+//     if (isInternalOp(uri)) return;
+//     delayedVerify();
+//   });
+
+//   // ✅ NEW: Runtime tampered → restore
+//   runtimeWatcher.onDidChange(uri => {
+//     if (isInternalOp(uri)) return;
+//     delayedVerify();
+//   });
+
+//   // ✅ NEW: Metro config tampered → restore
+//   metroWatcher.onDidChange(uri => {
+//     if (isInternalOp(uri)) return;
+//     delayedVerify();
+//   });
+
+//   // Deletes → immediate restore
+//   keyWatcher.onDidDelete(uri => {
+//     if (isInternalOp(uri)) return;
+//     verifyAndRestore(ws);
+//   });
+
+//   storeWatcher.onDidDelete(uri => {
+//     if (isInternalOp(uri)) return;
+//     verifyAndRestore(ws);
+//   });
+
+//   // ✅ NEW: Runtime deleted → immediate restore
+//   runtimeWatcher.onDidDelete(uri => {
+//     if (isInternalOp(uri)) return;
+//     verifyAndRestore(ws);
+//   });
+
+//   // ✅ NEW: Metro config deleted → immediate restore
+//   metroWatcher.onDidDelete(uri => {
+//     if (isInternalOp(uri)) return;
+//     verifyAndRestore(ws);
+//   });
+
+//   // Poll fallback (guarantee)
+//   const interval = setInterval(() => {
+//     verifyAndRestore(ws).catch(() => {});
+//   }, 2000);
+
+//   extensionContext.subscriptions.push(
+//     keyWatcher,
+//     storeWatcher,
+//     recoveryWatcher,  // ✅ NEW
+//     runtimeWatcher,   // ✅ NEW
+//     metroWatcher,     // ✅ NEW
+//     { dispose: () => clearInterval(interval) }
+//   );
+
+// }
+
 function setupProtectionWatchers(extensionContext) {
   const ws = vscode.workspace.workspaceFolders?.[0];
   if (!ws) return;
@@ -658,9 +1121,20 @@ function setupProtectionWatchers(extensionContext) {
   const keyWatcher = vscode.workspace.createFileSystemWatcher(
     new vscode.RelativePattern(ws, PROJECT_KEY_FILE)
   );
-
   const storeWatcher = vscode.workspace.createFileSystemWatcher(
     new vscode.RelativePattern(ws, SECRET_FILE)
+  );
+  // ✅ NEW: Watch recovery file
+  const recoveryWatcher = vscode.workspace.createFileSystemWatcher(
+    new vscode.RelativePattern(ws, RECOVERY_FILE)
+  );
+  // ✅ NEW: Watch runtime file
+  const runtimeWatcher = vscode.workspace.createFileSystemWatcher(
+    new vscode.RelativePattern(ws, RUNTIME_FILE)
+  );
+  // ✅ NEW: Watch metro config
+  const metroWatcher = vscode.workspace.createFileSystemWatcher(
+    new vscode.RelativePattern(ws, METRO_CONFIG_FILE)
   );
 
   const delayedVerify = async () => {
@@ -668,29 +1142,21 @@ function setupProtectionWatchers(extensionContext) {
     await verifyAndRestore(ws);
   };
 
-  // Edits
-  keyWatcher.onDidChange(uri => {
-    if (isInternalOp(uri)) return;
-    delayedVerify();
-  });
+  // Watch all files for edit
+  [keyWatcher, storeWatcher, recoveryWatcher, runtimeWatcher, metroWatcher]
+    .forEach(w => w.onDidChange(uri => {
+      if (isInternalOp(uri)) return;
+      delayedVerify();
+    }));
 
-  storeWatcher.onDidChange(uri => {
-    if (isInternalOp(uri)) return;
-    delayedVerify();
-  });
+  // Watch all files for delete
+  [keyWatcher, storeWatcher, recoveryWatcher, runtimeWatcher, metroWatcher]
+    .forEach(w => w.onDidDelete(uri => {
+      if (isInternalOp(uri)) return;
+      verifyAndRestore(ws);
+    }));
 
-  // Deletes → immediate
-  keyWatcher.onDidDelete(uri => {
-    if (isInternalOp(uri)) return;
-    verifyAndRestore(ws);
-  });
-
-  storeWatcher.onDidDelete(uri => {
-    if (isInternalOp(uri)) return;
-    verifyAndRestore(ws);
-  });
-
-  // Poll fallback (guarantee)
+  // Poll fallback every 2 seconds
   const interval = setInterval(() => {
     verifyAndRestore(ws).catch(() => {});
   }, 2000);
@@ -698,72 +1164,172 @@ function setupProtectionWatchers(extensionContext) {
   extensionContext.subscriptions.push(
     keyWatcher,
     storeWatcher,
+    recoveryWatcher,  // ✅ NEW
+    runtimeWatcher,   // ✅ NEW
+    metroWatcher,     // ✅ NEW
     { dispose: () => clearInterval(interval) }
   );
 }
 
+async function fileExists(ws, relativePath) {
+  try {
+    // Support glob-like patterns (e.g. *.csproj)
+    if (relativePath.includes("*")) {
+      const files = await vscode.workspace.findFiles(
+        new vscode.RelativePattern(ws, relativePath),
+        "**/node_modules/**",
+        1
+      );
+      return files.length > 0;
+    }
+
+    await vscode.workspace.fs.stat(
+      vscode.Uri.joinPath(ws.uri, relativePath)
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 async function verifyAndRestore(ws) {
-  // ⏸ Temporarily suspended during trusted writes
   if (Date.now() < suspendAutoRestoreUntil) return;
 
   const recoveryUri = vscode.Uri.joinPath(ws.uri, RECOVERY_FILE);
-  const keyUri = vscode.Uri.joinPath(ws.uri, PROJECT_KEY_FILE);
-  const storeUri = vscode.Uri.joinPath(ws.uri, SECRET_FILE);
+  const keyUri      = vscode.Uri.joinPath(ws.uri, PROJECT_KEY_FILE);
+  const storeUri    = vscode.Uri.joinPath(ws.uri, SECRET_FILE);
+  const runtimeUri  = vscode.Uri.joinPath(ws.uri, RUNTIME_FILE);
+  const metroUri    = vscode.Uri.joinPath(ws.uri, METRO_CONFIG_FILE);
 
-  // No recovery → nothing to enforce
-  let recovery;
+  const fingerprint = await generateProjectFingerprint(ws);
+  const storageKey = `shielderx-recovery-${fingerprint.slice(0, 16)}`;
+
+  // ✅ Load globalState backup (source of truth)
+  let globalBackup = null;
   try {
-    recovery = JSON.parse(
-      (await vscode.workspace.fs.readFile(recoveryUri)).toString()
-    );
+    const stored = extensionContext?.globalState?.get(storageKey);
+    if (stored) globalBackup = JSON.parse(stored);
+  } catch {}
+
+  // ── Check .shielder.recovery ──
+  let recoveryOk = false;
+  let recoveryContent = null;
+
+  try {
+    recoveryContent = (await vscode.workspace.fs.readFile(recoveryUri)).toString();
+
+    if (globalBackup) {
+      // ✅ Compare hash with globalState copy
+      const currentHash = sha256(Buffer.from(recoveryContent));
+      if (currentHash !== globalBackup.hash) {
+        // Tampered! Restore from globalState
+        console.log("[ShielderX] Recovery file tampered → restoring from globalState");
+        markInternalOp(recoveryUri);
+        await vscode.workspace.fs.writeFile(recoveryUri, Buffer.from(globalBackup.content));
+        unmarkInternalOp(recoveryUri);
+        recoveryContent = globalBackup.content;
+      }
+    }
+
+    recoveryOk = true;
   } catch {
-    return;
+    // Recovery file deleted!
+    if (globalBackup) {
+      // Restore from globalState
+      console.log("[ShielderX] Recovery file deleted → restoring from globalState");
+      markInternalOp(recoveryUri);
+      await vscode.workspace.fs.writeFile(recoveryUri, Buffer.from(globalBackup.content));
+      unmarkInternalOp(recoveryUri);
+      recoveryContent = globalBackup.content;
+      recoveryOk = true;
+    }
   }
 
-  // Decrypt recovery snapshot
+  // No recovery anywhere → nothing to enforce
+  if (!recoveryOk || !recoveryContent) return;
+
+  // Decrypt snapshot
   let snapshot;
   try {
-    const fingerprint = await generateProjectFingerprint(ws);
+    const raw = JSON.parse(recoveryContent);
     const masterKey = crypto.scryptSync(fingerprint, "shielder-recovery", 32);
-    snapshot = JSON.parse(
-      decryptWithKey(masterKey, recovery.encrypted)
-    );
+    snapshot = JSON.parse(decryptWithKey(masterKey, raw.encrypted));
   } catch {
-    // Recovery exists but cannot decrypt → force restore
-    await restoreFromRecovery(ws);
     return;
   }
 
-  // Read current files
-  let keyBuf, storeBuf;
+  if (!snapshot) return;
+
+  // ── Check each file individually ──
+
+  // Check .shielder.key
+  let keyBuf;
   try { keyBuf = await vscode.workspace.fs.readFile(keyUri); } catch {}
-  try { storeBuf = await vscode.workspace.fs.readFile(storeUri); } catch {}
+  const keyOk = keyBuf && sha256(keyBuf) === snapshot.hashes.key;
 
-  // Missing files → restore
-  if (!keyBuf || !storeBuf) {
-    await restoreFromRecovery(ws);
-    return;
+  // Check .ai-secret-guard.json
+  let storeBuf;
+  try { storeBuf = await vscode.workspace.fs.readFile(storeUri); } catch {}
+  const storeOk = storeBuf && sha256(storeBuf) === snapshot.hashes.store;
+
+  // Check runtime
+  let runtimeOk = true;
+  if (snapshot.runtimeContent) {
+    try {
+      const runtimeBuf = await vscode.workspace.fs.readFile(runtimeUri);
+      runtimeOk = sha256(runtimeBuf) === sha256(Buffer.from(snapshot.runtimeContent));
+    } catch { runtimeOk = false; }
   }
 
-  // 🔐 HASH-BASED tamper detection
-  const currentKeyHash = sha256(keyBuf);
-  const currentStoreHash = sha256(storeBuf);
+  // Check metro
+  let metroOk = true;
+  if (snapshot.metroContent) {
+    try {
+      const metroBuf = await vscode.workspace.fs.readFile(metroUri);
+      metroOk = sha256(metroBuf) === sha256(Buffer.from(snapshot.metroContent));
+    } catch { metroOk = false; }
+  }
 
-  if (
-    currentKeyHash !== snapshot.hashes.key ||
-    currentStoreHash !== snapshot.hashes.store
-  ) {
-    await restoreFromRecovery(ws);
+  // ── Restore only what's missing/tampered ──
+  suspendAutoRestore(800);
+
+  if (!keyOk && snapshot.projectKey) {
+    markInternalOp(keyUri);
+    await vscode.workspace.fs.writeFile(keyUri, Buffer.concat([
+      Buffer.from("SHIELDER_KEY_v1\n"),
+      Buffer.from(snapshot.projectKey, "base64")
+    ]));
+    unmarkInternalOp(keyUri);
+  }
+
+  if (!storeOk && snapshot.store) {
+    markInternalOp(storeUri);
+    await vscode.workspace.fs.writeFile(storeUri,
+      Buffer.from(JSON.stringify(snapshot.store, null, 2))
+    );
+    unmarkInternalOp(storeUri);
+  }
+
+  if (!runtimeOk && snapshot.runtimeContent) {
+    markInternalOp(runtimeUri);
+    await vscode.workspace.fs.writeFile(runtimeUri,
+      Buffer.from(snapshot.runtimeContent)
+    );
+    unmarkInternalOp(runtimeUri);
+  }
+
+  if (!metroOk && snapshot.metroContent) {
+    markInternalOp(metroUri);
+    await vscode.workspace.fs.writeFile(metroUri,
+      Buffer.from(snapshot.metroContent)
+    );
+    unmarkInternalOp(metroUri);
   }
 }
 
 
 
-
 let blockingDialogActive = false;
-
-
 
 
 function handleManagedFileOpen(editor) {
@@ -772,30 +1338,27 @@ function handleManagedFileOpen(editor) {
   const file = editor.document.fileName;
   const fileName = path.basename(file);
 
-  if (
+  const isProtected =
     file.endsWith(PROJECT_KEY_FILE) ||
-    file.endsWith(SECRET_FILE)
-  ) {
+    file.endsWith(SECRET_FILE) ||
+    file.endsWith(RUNTIME_FILE) ||       // ✅ NEW
+    file.endsWith(METRO_CONFIG_FILE);    // ✅ NEW
+
+  if (isProtected) {
     if (blockingDialogActive) return;
     blockingDialogActive = true;
 
     vscode.window.showWarningMessage(
-      `🔒 Protected file detected
-
-File: ${fileName}
-
-This file is managed by Shielder.
-Manual editing is not allowed and changes will be reverted automatically.`,
+      `🔒 Protected file detected\n\nFile: ${fileName}\n\nThis file is managed by ShielderX.\nManual editing is not allowed and changes will be reverted automatically.`,
       { modal: true },
       "OK"
     ).then(() => {
       blockingDialogActive = false;
-      vscode.commands.executeCommand(
-        "workbench.action.closeActiveEditor"
-      );
+      vscode.commands.executeCommand("workbench.action.closeActiveEditor");
     });
   }
 }
+
 
 async function loadExistingSecretFile(ws) {
   const uri = vscode.Uri.joinPath(ws.uri, ".ai-secret-guard.json");
@@ -831,7 +1394,7 @@ async function handleShielderProtectCall(editor, lineNumber, lineText) {
     const ws = vscode.workspace.workspaceFolders?.[0];
     if (!ws) return;
 
-    await ensureProjectKey(ws);
+   await ensureProjectKey(ws, extensionContext);
     const store = await loadSecretFile(ws);
     const key = await getProjectKey(ws);
 
@@ -990,59 +1553,65 @@ async function detectPackageManager(ws) {
   return "npm"; // default fallback
 }
 
-async function ensureShielderRuntime(ws) {
-  const store = await loadSecretFile(ws);
-  const platform = await detectPlatform(ws);
+async function ensureShielderRuntime(ws, store) {
+  // 🛑 Guard 0: store or mode missing → NEVER install runtime
+  if (!store?.data?.mode) return;
 
+  const platform = await detectPlatform(ws);
   if (!platform) return;
 
-  // 🚫 Backend platforms → NO runtime install
- // 🚫 Platforms that REQUIRE a runtime SDK (not available yet)
-if (!platform.supportsRuntime) {
-  if (!store.data.backendNoticeShown) {
-    vscode.window.showInformationMessage(
-      `Shielder detected a ${platform.id.toUpperCase()} project.\n\n` +
-      `Runtime secret decryption for ${platform.id} requires a ` +
-      `platform-specific Shielder library, which is not available yet.\n\n` +
-      `Scan & protection will work, but secrets cannot be resolved at runtime.\n\n` +
-      `Support is coming soon.`,
-      { modal: true }
-    );
+  // 🛑 Guard 1: backend / unsupported platforms
+  if (!platform.supportsRuntime) {
+    if (!store.data.backendNoticeShown) {
+      vscode.window.showInformationMessage(
+        `Shielder detected a ${platform.id.toUpperCase()} project.\n\n` +
+        `Runtime secret decryption for ${platform.id} requires a ` +
+        `platform-specific Shielder library, which is not available yet.\n\n` +
+        `Scan & protection will work, but secrets cannot be resolved at runtime.\n\n` +
+        `Support is coming soon.`,
+        { modal: true }
+      );
 
-    store.data.backendNoticeShown = true;
+      store.data.backendNoticeShown = true;
 
-    markInternalOp(store.uri);
-    await vscode.workspace.fs.writeFile(
-      store.uri,
-      Buffer.from(JSON.stringify(store.data, null, 2))
-    );
-    unmarkInternalOp(store.uri);
-  }
-
-  return; // ⛔ absolutely no auto install / import
-}
-
-
-  // ✅ Already installed → skip
-  if (
-    store.data.runtime &&
-    store.data.runtime.id === platform.id
-  ) {
+      markInternalOp(store.uri);
+      await vscode.workspace.fs.writeFile(
+        store.uri,
+        Buffer.from(JSON.stringify(store.data, null, 2))
+      );
+      unmarkInternalOp(store.uri);
+    }
     return;
   }
 
-  const pm = await detectPackageManager(ws);
-
-  if (platform.id === "react-native") {
-    await runInstall(pm, "@shielder/react-native-runtime");
-  } else if (platform.id === "flutter") {
-    await runCommand(ws, "flutter pub add shielder_runtime");
-  } else {
-    // JS / TS / frontend / Node backend
-    await runInstall(pm, "@shielder/runtime");
+  // 🛑 Guard 2: runtime already installed for this platform
+  if (store.data.runtime) {
+    if (store.data.runtime.id === platform.id) {
+      return; // same platform → ok
+    }
+    // ⚠️ Platform changed (e.g. JS → RN)
+    delete store.data.runtime;
   }
 
-  // 💾 Persist once → prevents repeat installs
+  // 🧠 Decide package manager
+  const pm = await detectPackageManager(ws);
+
+  // 📦 Install correct runtime
+  if (platform.id === "react-native") {
+    await runInstall(pm, "@shielderx/react-native-runtime");
+
+    // 🔥 CRITICAL: create RN bootstrap file
+    await ensureShielderRuntimeBootstrap(ws);
+  } 
+  else if (platform.id === "flutter") {
+    await runCommand(ws, "flutter pub add shielder_runtime");
+  } 
+  else {
+    // JS / TS / Web / Node
+    await runInstall(pm, "@shielderx/runtime");
+  }
+
+  // 💾 Persist runtime state
   store.data.runtime = {
     id: platform.id,
     installedAt: new Date().toISOString()
@@ -1057,6 +1626,7 @@ if (!platform.supportsRuntime) {
 }
 
 
+
 function openBackendDocs(platformId) {
   vscode.env.openExternal(
     vscode.Uri.parse(
@@ -1066,6 +1636,159 @@ function openBackendDocs(platformId) {
 }
 
 
+async function ensureShielderRuntimeBootstrap(ws, extensionContext) {
+  const runtimeUri = vscode.Uri.joinPath(ws.uri, "shielderx.runtime.js");
+
+  const storeData = await loadSecretFile(ws, { createIfMissing: false });
+  
+  if (!storeData || !storeData.data) {
+    vscode.window.showErrorMessage('ShielderX: No store data available');
+    return;
+  }
+
+  let key = null;
+
+  if (storeData.data.mode === "project") {
+    const projectKey = await getProjectKey(ws);
+    key = projectKey.toString("base64");
+  }
+
+  if (storeData.data.mode === "machine") {
+    const machineKey = await getOrCreateMachineKey(extensionContext);
+    key = machineKey.toString("base64");
+  }
+
+  // 🔐 Level 2 obfuscation for key
+  const keyCharCodes = [];
+  for (let i = 0; i < key.length; i++) {
+    keyCharCodes.push(key.charCodeAt(i));
+  }
+  
+  const xorKey = 0x5A;
+  const obfuscatedCodes = keyCharCodes.map(code => code ^ xorKey);
+  
+  const chunks = [];
+  const chunkSize = 8;
+  for (let i = 0; i < obfuscatedCodes.length; i += chunkSize) {
+    chunks.push(obfuscatedCodes.slice(i, i + chunkSize));
+  }
+
+  // 🔥 NO EMBEDDED STORE - Load from JSON file only
+  const content = `// AUTO-GENERATED BY SHIELDER — DO NOT EDIT
+// ShielderX Runtime Bootstrap (Level 2 Security)
+
+(function () {
+  if (global.__SHIELDER_INITIALIZED__) {
+    console.warn('[ShielderX] Already initialized');
+    return;
+  }
+
+  // Load store from .ai-secret-guard.json
+  let store = null;
+  try {
+    store = require('./.ai-secret-guard.json');
+    console.log('[ShielderX] Store loaded from .ai-secret-guard.json');
+  } catch (e) {
+    console.error('[ShielderX] CRITICAL: Could not load .ai-secret-guard.json');
+    console.error('[ShielderX] Error:', e.message);
+    console.error('[ShielderX] Make sure metro.config.js includes JSON files');
+    // Don't fallback - fail clearly so developer knows there's an issue
+    return;
+  }
+
+  // 🔐 Obfuscated key reconstruction
+  const _k = ${JSON.stringify(chunks)};
+  const _x = 0x5A;
+  const _d = (c) => c.map(n => n ^ _x).map(n => String.fromCharCode(n)).join('');
+  const key = _k.map(_d).join('');
+
+  global.__SHIELDER_STORE__ = store;
+  global.__SHIELDER_KEY__ = key;
+  global.__SHIELDER_INITIALIZED__ = true;
+
+  if (typeof __DEV__ !== 'undefined' && __DEV__) {
+    console.log('[ShielderX] Runtime initialized');
+    console.log('[ShielderX] Key present:', !!global.__SHIELDER_KEY__);
+    console.log('[ShielderX] Store present:', !!global.__SHIELDER_STORE__);
+    console.log('[ShielderX] Secret count:', store?.secrets?.length || 0);
+  }
+})();
+`;
+
+  markInternalOp(runtimeUri);
+  await vscode.workspace.fs.writeFile(runtimeUri, Buffer.from(content));
+  unmarkInternalOp(runtimeUri);
+
+  vscode.window.showInformationMessage('✓ ShielderX runtime bootstrap generated');
+}
+
+async function ensureMetroConfig(ws) {
+  const metroConfigUri = vscode.Uri.joinPath(ws.uri, "metro.config.js");
+  
+  let configContent = '';
+  let configExists = false;
+  
+  try {
+    configContent = (await vscode.workspace.fs.readFile(metroConfigUri)).toString();
+    configExists = true;
+  } catch {
+    // File doesn't exist
+  }
+
+  // Check if already has ShielderX config
+  if (configContent.includes('ShielderX') || configContent.includes('.ai-secret-guard.json')) {
+    return; // Already configured
+  }
+
+  let newConfig;
+
+  if (!configExists || configContent.trim().length === 0) {
+    // Create new config
+    newConfig = `// Metro configuration for React Native
+// ShielderX: Ensure .ai-secret-guard.json is included in bundle
+const { getDefaultConfig } = require('expo/metro-config');
+
+const config = getDefaultConfig(__dirname);
+
+// Include .ai-secret-guard.json in bundle
+config.resolver.assetExts.push('json');
+
+module.exports = config;
+`;
+  } else {
+    // Append to existing config
+    newConfig = configContent + `
+
+// ShielderX: Ensure .ai-secret-guard.json is included in bundle
+// (Added automatically by ShielderX extension)
+if (config.resolver && config.resolver.assetExts) {
+  config.resolver.assetExts.push('json');
+}
+`;
+  }
+
+  await vscode.workspace.fs.writeFile(metroConfigUri, Buffer.from(newConfig));
+  
+  vscode.window.showInformationMessage(
+    '✓ Metro config updated to include .ai-secret-guard.json'
+  );
+}
+
+async function isExpoProject(ws) {
+  try {
+    const pkgUri = vscode.Uri.joinPath(ws.uri, "package.json");
+    const pkg = JSON.parse(
+      (await vscode.workspace.fs.readFile(pkgUri)).toString()
+    );
+
+    return (
+      typeof pkg.main === "string" &&
+      pkg.main.includes("expo/AppEntry")
+    );
+  } catch {
+    return false;
+  }
+}
 
 
 async function runInstall(pm, pkg) {
@@ -1147,6 +1870,7 @@ setupProtectionWatchers(extensionContext);
     );
   })
 );
+
 
 
   extensionContext.subscriptions.push(
@@ -1231,6 +1955,17 @@ unmarkInternalOp(store.uri);
     })
   );
 
+
+extensionContext.subscriptions.push(
+  vscode.commands.registerCommand("shielder.generateRecovery", async () => {
+    const ws = vscode.workspace.workspaceFolders?.[0];
+    if (!ws) {
+      vscode.window.showErrorMessage("ShielderX: No workspace open");
+      return;
+    }
+    await generateRecovery(ws, extensionContext);
+  })
+);
 
 extensionContext.subscriptions.push(
   vscode.workspace.onDidChangeTextDocument(async event => {
@@ -1374,12 +2109,12 @@ extensionContext.subscriptions.push(
       const ws = vscode.workspace.workspaceFolders?.[0];
       if (!ws) return;
 
-      await ensureProjectKey(ws);
+    await ensureProjectKey(ws, extensionContext);
       const store = await loadSecretFile(ws);
 
       let key;
       if (store.data.mode === "project") {
-        await ensureProjectKey(ws);
+       await ensureProjectKey(ws, extensionContext);
         key = await getProjectKey(ws);
       } else {
         key = await getOrCreateMachineKey(extensionContext);
@@ -1484,27 +2219,39 @@ extensionContext.subscriptions.push(
 );
 
 extensionContext.subscriptions.push(
-  vscode.commands.registerCommand("shielder.revertProject", async () => {
-    const ws = vscode.workspace.workspaceFolders?.[0];
-    if (!ws) return;
+ vscode.commands.registerCommand("shielder.revertProject", async () => {
+  const ws = vscode.workspace.workspaceFolders?.[0];
+  if (!ws) return;
 
-    const state = await getProtectionState(extensionContext, ws);
+  const state = await getProtectionState(extensionContext, ws);
 
-    if (!state.protected) {
-      if (!state.store || !state.mode) {
-        openOnOpenWarning(ws);
+  if (!state.protected) {
+    if (!state.store || !state.mode) {
+      // ✅ FIX: Check if project is actually protected before showing onboarding
+      const alreadyProtected = await isProjectAlreadyProtected(ws);
+
+      if (alreadyProtected) {
+        vscode.window.showWarningMessage(
+          "⚠️ ShielderX files are missing! Run 'ShielderX: Generate Recovery' first.",
+          "Generate Recovery"
+        ).then(choice => {
+          if (choice === "Generate Recovery") {
+            vscode.commands.executeCommand("shielder.generateRecovery");
+          }
+        });
         return;
       }
 
-      vscode.window.showWarningMessage(
-        "🔐 Project is not fully protected yet."
-      );
+      openOnOpenWarning(ws);
       return;
     }
 
-    // ✅ safe
-    openRevertConfirm(extensionContext, ws);
-  })
+    vscode.window.showWarningMessage("🔐 Project is not fully protected yet.");
+    return;
+  }
+
+  openRevertConfirm(extensionContext, ws);
+})
 );
 
 
@@ -1523,27 +2270,39 @@ extensionContext.subscriptions.push(
 
 
 extensionContext.subscriptions.push(
-  vscode.commands.registerCommand("shielder.manageSecrets", async () => {
-    const ws = vscode.workspace.workspaceFolders?.[0];
-    if (!ws) return;
+ vscode.commands.registerCommand("shielder.manageSecrets", async () => {
+  const ws = vscode.workspace.workspaceFolders?.[0];
+  if (!ws) return;
 
-    const state = await getProtectionState(extensionContext, ws);
+  const state = await getProtectionState(extensionContext, ws);
 
-    if (!state.protected) {
-      if (!state.store || !state.mode) {
-        openOnOpenWarning(ws); // choose mode
+  if (!state.protected) {
+    if (!state.store || !state.mode) {
+      // ✅ FIX: Check if project is actually protected before showing onboarding
+      const alreadyProtected = await isProjectAlreadyProtected(ws);
+
+      if (alreadyProtected) {
+        vscode.window.showWarningMessage(
+          "⚠️ ShielderX files are missing! Run 'ShielderX: Generate Recovery' first.",
+          "Generate Recovery"
+        ).then(choice => {
+          if (choice === "Generate Recovery") {
+            vscode.commands.executeCommand("shielder.generateRecovery");
+          }
+        });
         return;
       }
 
-      vscode.window.showWarningMessage(
-        "🔐 Project is not fully protected yet."
-      );
+      openOnOpenWarning(ws);
       return;
     }
 
-    // ✅ safe
-    openManageSecrets(ws);
-  })
+    vscode.window.showWarningMessage("🔐 Project is not fully protected yet.");
+    return;
+  }
+
+  openManageSecrets(ws);
+})
 );
 
   /* -------- SCAN PROJECT -------- */
@@ -1557,14 +2316,10 @@ extensionContext.subscriptions.push(
       return;
     }
 
-     await ensureShielderRuntime(ws);
-
-    // 1️⃣ Always load/create store
+  // 1️⃣ Always load/create store
     const store = await loadSecretFile(ws);
 
-    if (!store.data.owner) {
-  store.data.owner = getCurrentActor();
-}
+    console.log("[Shielder] store mode:", store?.data?.mode, "secrets:", (store?.data?.secrets||[]).length);
 
 
     // 2️⃣ Mode must exist
@@ -1573,10 +2328,18 @@ extensionContext.subscriptions.push(
       return;
     }
 
+const platform = await detectPlatform(ws);
+const runtimeImport = getRuntimeImport(platform);
+
+
+    if (!store.data.owner) {
+  store.data.owner = getCurrentActor();
+}
+
     // 3️⃣ Resolve key
     let key;
     if (store.data.mode === "project") {
-      await ensureProjectKey(ws);
+     await ensureProjectKey(ws, extensionContext);
       key = await getProjectKey(ws);
     } else {
       // ✅ MACHINE MODE → SILENT
@@ -1588,10 +2351,18 @@ extensionContext.subscriptions.push(
       return;
     }
 
-    const files = await vscode.workspace.findFiles(
-      "**/*.{js,ts,jsx,tsx}",
-      "**/node_modules/**"
-    );
+    await ensureMetroConfig(ws);
+
+//  await ensureShielderRuntime(ws, store);
+
+   const files = await vscode.workspace.findFiles(
+  "**/*.{js,ts,jsx,tsx}",
+  "{**/node_modules/**,**/.vscode/**,**/.expo/**}"
+);
+
+console.log("[Shielder] found files:", files.length);
+for (const f of files.slice(0,20)) { console.log("[Shielder] ->", f.fsPath); }
+
 
     let updatedFiles = 0;
     let detectedAny = false;
@@ -1604,7 +2375,14 @@ extensionContext.subscriptions.push(
       let changed = false;
 
       for (let i = 0; i < lines.length; i++) {
+        if (i < 5) console.log(`[Shielder] scanning ${file.fsPath} line ${i+1}: ${lines[i].slice(0,200)}`);
+
         const found = detect(lines[i]);
+
+        if (found.length) console.log(`[Shielder] detect() -> `, found);
+
+
+        
         if (!found.length) continue;
 
         for (const s of found) {
@@ -1642,12 +2420,29 @@ extensionContext.subscriptions.push(
         }
       }
 
-      if (changed) {
-        if (!original.includes("@shielder/runtime")) {
-          lines.unshift(
-            'import { resolveSecret } from "@shielder/runtime";'
-          );
-        }
+if (changed) {
+  // ✅ FIX: Only add imports to JS/JSX/TS/TSX files, NOT config files
+  const fileName = path.basename(file.fsPath);
+  const isSourceFile = /\.(js|jsx|ts|tsx)$/.test(fileName);
+  const isConfigFile = fileName.includes('config') || 
+                       fileName.includes('metro.') || 
+                       fileName.includes('babel.');
+  
+  if (runtimeImport && !original.includes(runtimeImport) && isSourceFile && !isConfigFile) {
+    // 1) ensure runtime API import is present (will be second)
+    if (!original.includes(`import { resolveSecret } from "${runtimeImport}"`)) {
+      lines.unshift(`import { resolveSecret } from "${runtimeImport}";`);
+    }
+
+    // 2) then ensure bootstrap import is the very first line (so it runs before anything)
+    if (platform.id === "react-native") {
+      if (!original.includes('import "./shielderx.runtime"')) {
+        // put bootstrap BEFORE the runtime API import
+        lines.unshift('import "./shielderx.runtime";');
+      }
+    }
+  }
+
 
        suspendAutoRestore(800);
 markInternalOp(file);
@@ -1675,7 +2470,7 @@ await vscode.workspace.fs.writeFile(
 );
 unmarkInternalOp(store.uri);
 
-
+await ensureShielderRuntime(ws, store);
 
     await writeRecoveryFile(ws, extensionContext);
     updateShielderStatus(store.data.mode,  store.data.owner);
@@ -1787,9 +2582,12 @@ async function findCurrentLine(ws, secret) {
       line: line ?? "—",
       placeholder: s.placeholder,
       disabled: s.disabled,
-      length: s.encrypted?.data
-        ? Math.floor(s.encrypted.data.length / 2)
-        : 8
+      length: typeof s.encrypted === "string"
+  ? s.encrypted.length
+  : s.encrypted?.data
+    ? Math.floor(s.encrypted.data.length / 2)
+    : 8
+
     });
   }
 
@@ -2614,7 +3412,7 @@ async function handleWorkspaceOpen(extensionContext) {
     await vscode.workspace.fs.stat(recoveryUri);
     await verifyAndRestore(ws);
   } catch {
-    // no recovery yet → continue normally
+    // no recovery yet → continue
   }
 
   // ─────────────────────────────
@@ -2623,6 +3421,27 @@ async function handleWorkspaceOpen(extensionContext) {
   const store = await loadSecretFile(ws, { createIfMissing: false });
 
   if (!store || !store.data?.mode) {
+    // ✅ FIX: Check source files BEFORE showing fresh install popup
+    const alreadyProtected = await isProjectAlreadyProtected(ws);
+
+    if (alreadyProtected) {
+      // Project IS protected but ShielderX files are missing
+      // Show recovery warning instead of fresh install popup
+      updateShielderStatus(null, null);
+      vscode.window.showWarningMessage(
+        "⚠️ ShielderX: Protected project detected but config files are missing!\n\n" +
+        "Run 'ShielderX: Generate Recovery' to restore all files.",
+        "Generate Recovery",
+        "Dismiss"
+      ).then(choice => {
+        if (choice === "Generate Recovery") {
+          vscode.commands.executeCommand("shielder.generateRecovery");
+        }
+      });
+      return;
+    }
+
+    // Truly a fresh project → show onboarding
     updateShielderStatus(null, null);
     openOnOpenWarning(ws);
     return;
@@ -3015,6 +3834,19 @@ function getOnOpenWarningHTML() {
 
 */
 
+
+async function runUninstall(pm, pkg) {
+  if (pm === "npm") {
+    await runCommand(ws, `npm uninstall ${pkg}`);
+  } else if (pm === "yarn") {
+    await runCommand(ws, `yarn remove ${pkg}`);
+  } else if (pm === "pnpm") {
+    await runCommand(ws, `pnpm remove ${pkg}`);
+  }
+}
+
+
+
 async function revertProject(extensionContext, ws) {
   // 🛑 Stop auto-restore during full revert
   suspendAutoRestore(3000);
@@ -3091,12 +3923,17 @@ async function revertProject(extensionContext, ws) {
       '""'
     );
 
-    // 4c️⃣ Remove runtime import if no resolveSecret remains
+    // 4c️⃣ Remove ANY Shielder runtime import if no resolveSecret remains
     if (!content.includes("resolveSecret(")) {
       content = content.replace(
-        /import\s+\{\s*resolveSecret\s*\}\s+from\s+["']@shielder\/runtime["'];?\s*\n?/g,
+        /import\s+\{\s*resolveSecret\s*\}\s+from\s+["']@shielder[^"']*["'];?\s*\n?/g,
         ""
       );
+
+       content = content.replace(
+    /import\s+["']\.\/shielderx\.runtime["'];?\s*\n?/g,
+    ""
+  );
     }
 
     // 4d️⃣ Write reverted file safely
@@ -3138,13 +3975,71 @@ async function revertProject(extensionContext, ws) {
   // 8️⃣ Close all editors (avoid stale buffers)
   await vscode.commands.executeCommand("workbench.action.closeAllEditors");
 
-  // 9️⃣ Final UI cleanup
+  // 9️⃣ Runtime & dependency cleanup
+  const platform = await detectPlatform(ws);
+  const pm = await detectPackageManager(ws);
+
+ if (platform?.id === "react-native") {
+  // 1️⃣ Remove generated bootstrap file
+  const runtimeFile = vscode.Uri.joinPath(ws.uri, "shielderx.runtime.js");
+  const metroFile = vscode.Uri.joinPath(ws.uri, "metro.config.js");
+  try {
+    await vscode.workspace.fs.delete(runtimeFile);
+     await vscode.workspace.fs.delete(metroFile);
+  } catch {}
+
+  // 2️⃣ Uninstall RN runtime package
+  await runUninstall(pm, "@shielderx/react-native-runtime");
+}
+
+if (platform?.supportsRuntime && platform?.id !== "react-native") {
+  await runUninstall(pm, "@shielderx/runtime");
+}
+
+  // 🔥 Remove generated RN bootstrap file
+  const runtimeFile = vscode.Uri.joinPath(ws.uri, "shielderx.runtime.js");
+  try {
+    await vscode.workspace.fs.delete(runtimeFile);
+  } catch {
+    // ignore if not exists
+  }
+
+  // 🔚 Final UI cleanup
   updateShielderStatus(null);
   vscode.window.showInformationMessage(
     "🔓 Shielder protection removed. All secrets restored and protection fully disabled."
   );
 }
 
+
+async function removeDependency(ws, pkgName) {
+  try {
+    const pkgUri = vscode.Uri.joinPath(ws.uri, "package.json");
+    const raw = await vscode.workspace.fs.readFile(pkgUri);
+    const pkg = JSON.parse(raw.toString());
+
+    let changed = false;
+
+    if (pkg.dependencies?.[pkgName]) {
+      delete pkg.dependencies[pkgName];
+      changed = true;
+    }
+
+    if (pkg.devDependencies?.[pkgName]) {
+      delete pkg.devDependencies[pkgName];
+      changed = true;
+    }
+
+    if (changed) {
+      await vscode.workspace.fs.writeFile(
+        pkgUri,
+        Buffer.from(JSON.stringify(pkg, null, 2))
+      );
+    }
+  } catch {
+    // ignore if package.json missing or malformed
+  }
+}
 
 
 

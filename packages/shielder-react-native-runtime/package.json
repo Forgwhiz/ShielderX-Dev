@@ -1,0 +1,12 @@
+{
+ "name": "@shielderx/react-native-runtime",
+  "version": "0.0.10",
+  "main": "src/index.js",
+  "description": "Shielder runtime decryption for React Native and Expo",
+  "keywords": ["shielder", "react-native", "expo", "secrets"],
+  "author": "Shielder",
+  "license": "MIT",
+  "dependencies": {
+    "crypto-js": "^4.2.0"
+  }
+}
