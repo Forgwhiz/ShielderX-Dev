@@ -1,24 +1,34 @@
+// crypto.js
+// @shielderx/runtime - Node.js version
+
 const crypto = require("crypto");
-const { ShielderRuntimeError } = require("./errors");
 
-function decryptPayload(payload, key) {
+/**
+ * Decrypt using AES-256-CBC (same as React Native)
+ * @param {string} keyBase64 - Base64 encoded key
+ * @param {object} payload - {iv: base64, data: base64}
+ * @returns {string} Decrypted plaintext
+ */
+function decryptWithKey(keyBase64, payload) {
   try {
-    const iv = Buffer.from(payload.iv, "hex");
-    const tag = Buffer.from(payload.tag, "hex");
-    const encrypted = Buffer.from(payload.data, "hex");
+    // Convert base64 to buffers
+    const key = Buffer.from(keyBase64, 'base64');
+    const iv = Buffer.from(payload.iv, 'base64');
+    const data = Buffer.from(payload.data, 'base64');
 
-    const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
-    decipher.setAuthTag(tag);
-
+    // Decrypt using AES-256-CBC (matching React Native)
+    const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+    
     const decrypted = Buffer.concat([
-      decipher.update(encrypted),
+      decipher.update(data),
       decipher.final()
     ]);
 
-    return decrypted.toString("utf8");
-  } catch {
-    throw new ShielderRuntimeError("Failed to decrypt secret.");
+    return decrypted.toString('utf8');
+  } catch (error) {
+    console.error('[ShielderX] Decryption failed:', error.message);
+    throw error;
   }
 }
 
-module.exports = { decryptPayload };
+module.exports = { decryptWithKey };

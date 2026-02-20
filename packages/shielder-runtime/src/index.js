@@ -1,3 +1,14 @@
+// index.js
+// @shielderx/runtime - Node.js version
+
 const { resolveSecret } = require("./resolver");
 
-module.exports = { resolveSecret };
+// CommonJS
+module.exports = {
+  resolveSecret
+};
+
+// ESModule compatibility
+module.exports.default = {
+  resolveSecret
+};

@@ -1,10 +1,23 @@
 {
   "name": "@shielderx/runtime",
-  "version": "0.0.1",
+  "version": "0.0.3",
   "main": "src/index.js",
+  "types": "src/index.d.ts",
   "type": "commonjs",
-  "description": "Shielder runtime decryption for JS / Node / Web",
-  "keywords": ["shielder", "secrets", "runtime", "security"],
+  "description": "ShielderX runtime for Node.js backends",
+  "keywords": [
+    "shielderx",
+    "secrets",
+    "runtime",
+    "security",
+    "encryption"
+  ],
   "author": "ShielderX",
-  "license": "MIT"
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "files": [
+    "src/"
+  ]
 }

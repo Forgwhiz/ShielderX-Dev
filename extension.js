@@ -102,23 +102,126 @@ function findResolveSecretRange(document, position) {
 
 
 function isLikelyKey(value) {
-  if (!value) return false;
+  if (!value || typeof value !== 'string') return false;
 
-  // minimum length you want to support
-  if (value.length < 7) return false;
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // STEP 1: BLACKLIST — Skip obvious non-secrets
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  // ❌ Clearly human-readable → skip
-  if (/^[a-zA-Z\s]+$/.test(value)) return false;       // plain words
-  if (/^[A-Z_]+$/.test(value)) return false;           // APP_START
-  if (/^[a-z]+(-[a-z]+)+$/.test(value)) return false;  // kebab-case
-  if (/^[a-zA-Z_]+$/.test(value)) return false;        // identifiers
-  if (/^[\p{Emoji}\s:]+$/u.test(value)) return false; // emoji / log text
+  // Skip URLs and paths
+  if (/^https?:\/\//.test(value)) return false;        // https://example.com
+  if (/^\/[a-z]/.test(value)) return false;            // /api/auth, /health
+  if (/^@[a-z]/.test(value)) return false;             // @shielderx/runtime
+  
+  // Skip common file extensions
+  if (/\.(js|ts|json|md|txt|html|css)$/i.test(value)) return false;
+  
+  // Skip hidden file names
+  if (/^\.[a-z-]+\.[a-z]+$/i.test(value)) return false; // .shielder.key
+  
+  // Skip plain text (only letters and spaces)
+  if (/^[a-zA-Z\s]+$/.test(value)) return false;       // "Hello World"
+  
+  // Skip CONSTANT_NAMES
+  if (/^[A-Z][A-Z0-9_]*$/.test(value)) return false;   // APP_START
+  
+  // Skip kebab-case
+  if (/^[a-z]+(-[a-z]+)+$/.test(value)) return false;  // kebab-case-name
+  
+  // Skip camelCase identifiers
+  if (/^[a-z][a-zA-Z0-9]*$/.test(value) && value.length < 20) return false; // userId
+  
+  // Skip simple numbers
+  if (/^[0-9]+$/.test(value)) return false;            // 12345
+  
+  // Skip port numbers and simple IDs
+  if (/^[0-9]{1,5}$/.test(value)) return false;        // 3000
+  
+  // Skip version numbers
+  if (/^v?\d+\.\d+(\.\d+)?/.test(value)) return false; // v1.0.0
+  
+  // Skip emoji and symbols only
+  if (/^[\p{Emoji}\s:!?.,-]+$/u.test(value)) return false;
 
-  // ✅ Everything else is considered a key
-  return true;
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // STEP 2: HIGH-CONFIDENCE PATTERNS — Auto-detect these
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  // Stripe API keys
+  if (/^sk_(live|test)_[A-Za-z0-9]{20,}$/.test(value)) return true;
+  
+  // Bearer tokens
+  if (/^Bearer\s+[A-Za-z0-9_.-]+$/.test(value)) return true;
+  
+  // JWT tokens (always start with eyJ)
+  if (/^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value)) return true;
+  
+  // AWS access keys (start with AKIA)
+  if (/^AKIA[A-Z0-9]{16}$/.test(value)) return true;
+  
+  // Database connection strings
+  if (/^(postgresql|mongodb|mysql):\/\/.*:.*@/.test(value)) return true;
+  
+  // Long hex strings (32+ chars = likely hash/key)
+  if (/^[0-9a-fA-F]{32,}$/.test(value)) return true;
+  
+  // UUID/GUID
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) return true;
+  
+  // Base64 encoded strings (40+ chars)
+  if (/^[A-Za-z0-9+/]{40,}={0,2}$/.test(value)) return true;
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // STEP 3: LENGTH + COMPLEXITY CHECK
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  // Minimum 16 characters for generic secrets
+  // (Most API keys, tokens are 20+ chars)
+  if (value.length < 16) return false;
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // STEP 4: ENTROPY CHECK — Detect random-looking strings
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  // Calculate Shannon entropy
+  const freq = {};
+  for (const char of value) {
+    freq[char] = (freq[char] || 0) + 1;
+  }
+
+  let entropy = 0;
+  const len = value.length;
+  for (const count of Object.values(freq)) {
+    const p = count / len;
+    entropy -= p * Math.log2(p);
+  }
+
+  // High entropy = random/complex = likely secret
+  // Entropy > 4.0 for strings 16+ chars
+  if (entropy > 4.0) return true;
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // STEP 5: CHARACTER MIX CHECK — Detect strong passwords
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  // For 16-32 char strings, check if it's a strong password pattern
+  if (value.length >= 16 && value.length <= 32) {
+    const hasUpper = /[A-Z]/.test(value);
+    const hasLower = /[a-z]/.test(value);
+    const hasDigit = /[0-9]/.test(value);
+    const hasSymbol = /[^A-Za-z0-9]/.test(value);
+
+    // Strong password: has 3+ of these
+    const strength = [hasUpper, hasLower, hasDigit, hasSymbol].filter(Boolean).length;
+    if (strength >= 3) return true;
+  }
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // DEFAULT: Skip everything else
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  return false;
 }
-
-
 
 function shouldSkipScanFile(uri) {
   const fsPath = uri.fsPath;
@@ -182,25 +285,59 @@ async function packageJsonHas(ws, pkgName) {
 
 
 const PLATFORMS = [
- {
-  id: "react-native",
-  supportsRuntime: true,
-  detect: async (ws) =>
-    (await packageJsonHas(ws, "react-native")) ||
-    (await packageJsonHas(ws, "expo")) ||
-    (await isExpoProject(ws)) ||              // ✅ REQUIRED
-    (await fileExists(ws, "app.json")) ||
-    (await fileExists(ws, "expo-env.d.ts")) ||
-    (await fileExists(ws, "ios")) ||
-    (await fileExists(ws, "android"))
-},
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // JAVASCRIPT/NODE — CHECK FIRST with React Native EXCLUSION
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  {
+    id: "javascript",
+    supportsRuntime: true,
+    detect: async (ws) => {
+      // Must have package.json
+      if (!await fileExists(ws, "package.json")) return false;
+      
+      // ✅ Exclude if it's actually React Native
+      const isRN = 
+        (await packageJsonHas(ws, "react-native")) ||
+        (await packageJsonHas(ws, "expo")) ||
+        (await isExpoProject(ws));
+      
+      // If NOT React Native, it's Node.js/JavaScript
+      return !isRN;
+    }
+  },
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // REACT NATIVE — More strict detection
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  {
+    id: "react-native",
+    supportsRuntime: true,
+    detect: async (ws) => {
+      // Must have package.json with react-native or expo dependency
+      const hasRNDep = 
+        (await packageJsonHas(ws, "react-native")) ||
+        (await packageJsonHas(ws, "expo"));
+      
+      if (hasRNDep) return true;
+      
+      // OR must be an Expo project
+      if (await isExpoProject(ws)) return true;
+      
+      // OR must have BOTH ios/ and android/ folders (clear RN project)
+      const hasIOS = await fileExists(ws, "ios");
+      const hasAndroid = await fileExists(ws, "android");
+      if (hasIOS && hasAndroid) return true;
+      
+      return false;
+    }
+  },
+
+  // Other platforms remain the same
   {
     id: "flutter",
     supportsRuntime: true,
     detect: async (ws) => await fileExists(ws, "pubspec.yaml")
   },
- 
-  // Java
   {
     id: "java",
     supportsRuntime: false,
@@ -208,8 +345,6 @@ const PLATFORMS = [
       await fileExists(ws, "pom.xml") ||
       await fileExists(ws, "build.gradle")
   },
-
-  // Python
   {
     id: "python",
     supportsRuntime: false,
@@ -217,22 +352,16 @@ const PLATFORMS = [
       await fileExists(ws, "requirements.txt") ||
       await fileExists(ws, "pyproject.toml")
   },
-
-  // Go
   {
     id: "go",
     supportsRuntime: false,
     detect: async (ws) => await fileExists(ws, "go.mod")
   },
-
-  // PHP
   {
     id: "php",
     supportsRuntime: false,
     detect: async (ws) => await fileExists(ws, "composer.json")
   },
-
-  // C#
   {
     id: "dotnet",
     supportsRuntime: false,
@@ -248,12 +377,7 @@ const PLATFORMS = [
       await fileExists(ws, "go.mod") ||
       await fileExists(ws, "composer.json") ||
       await fileExists(ws, "*.csproj")
-  },
-   { // JavaScript / TypeScript (frontend + Node backend)
-    id: "javascript",
-    supportsRuntime: true,
-    detect: async (ws) => await fileExists(ws, "package.json")
-  },
+  }
 ];
 
 
@@ -1342,7 +1466,8 @@ function handleManagedFileOpen(editor) {
     file.endsWith(PROJECT_KEY_FILE) ||
     file.endsWith(SECRET_FILE) ||
     file.endsWith(RUNTIME_FILE) ||       // ✅ NEW
-    file.endsWith(METRO_CONFIG_FILE);    // ✅ NEW
+    file.endsWith(METRO_CONFIG_FILE) ||
+    file.endsWith(RECOVERY_FILE);   // ✅ NEW
 
   if (isProtected) {
     if (blockingDialogActive) return;
@@ -1596,20 +1721,27 @@ async function ensureShielderRuntime(ws, store) {
   // 🧠 Decide package manager
   const pm = await detectPackageManager(ws);
 
-  // 📦 Install correct runtime
-  if (platform.id === "react-native") {
-    await runInstall(pm, "@shielderx/react-native-runtime");
+ // 📦 Install correct runtime
+if (platform.id === "react-native") {
+  await runInstall(pm, "@shielderx/react-native-runtime");
 
-    // 🔥 CRITICAL: create RN bootstrap file
-    await ensureShielderRuntimeBootstrap(ws);
-  } 
-  else if (platform.id === "flutter") {
-    await runInstall(pm, "shielder_runtime"); // uses terminal like others
-  } 
-  else {
-    // JS / TS / Web / Node
-    await runInstall(pm, "@shielderx/runtime");
-  }
+  // 🔥 CRITICAL: create RN bootstrap file
+  await ensureShielderRuntimeBootstrap(ws);
+} 
+else if (platform.id === "flutter") {
+  await runInstall(pm, "shielder_runtime"); // uses terminal like others
+} 
+else if (platform.id === "javascript") {
+  // Node.js / JavaScript
+  await runInstall(pm, "@shielderx/runtime");
+  
+  // 🔥 CRITICAL: create Node.js bootstrap file (same as RN)
+  await ensureShielderRuntimeBootstrap(ws);
+}
+else {
+  // Other platforms
+  await runInstall(pm, "@shielderx/runtime");
+}
 
   // 💾 Persist runtime state
   store.data.runtime = {
@@ -2422,29 +2554,79 @@ for (const f of files.slice(0,20)) { console.log("[Shielder] ->", f.fsPath); }
 
 if (changed) {
   // ✅ FIX: Only add imports to JS/JSX/TS/TSX files, NOT config files
-  const fileName = path.basename(file.fsPath);
+   const fileName = path.basename(file.fsPath);
   const isSourceFile = /\.(js|jsx|ts|tsx)$/.test(fileName);
   const isConfigFile = fileName.includes('config') || 
                        fileName.includes('metro.') || 
                        fileName.includes('babel.');
   
   if (runtimeImport && !original.includes(runtimeImport) && isSourceFile && !isConfigFile) {
-    // 1) ensure runtime API import is present (will be second)
-    if (!original.includes(`import { resolveSecret } from "${runtimeImport}"`)) {
-      lines.unshift(`import { resolveSecret } from "${runtimeImport}";`);
-    }
-
-    // 2) then ensure bootstrap import is the very first line (so it runs before anything)
-    if (platform.id === "react-native") {
-      if (!original.includes('import "./shielderx.runtime"')) {
-        // put bootstrap BEFORE the runtime API import
-        lines.unshift('import "./shielderx.runtime";');
+    
+     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // DETECT: Is this file CommonJS or ESM?
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
+    // Check for ESM patterns (import/export statements)
+    const hasESMImport = /^import\s+/m.test(original) || /\nimport\s+/m.test(original);
+    const hasESMExport = /^export\s+/m.test(original) || /\nexport\s+/m.test(original);
+    
+    // Check for CommonJS patterns (require statements)
+    const hasCommonJSRequire = /require\s*\(/m.test(original);
+    
+    // Decision: Use ESM only if file has import/export AND no require
+    const useESM = (hasESMImport || hasESMExport) && !hasCommonJSRequire;
+    
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 1) Add runtime API import (CommonJS or ESM based on detection)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
+    if (useESM) {
+      // ESM: import { resolveSecret } from "@shielderx/runtime"
+      if (!original.includes(`import { resolveSecret } from "${runtimeImport}"`)) {
+        lines.unshift(`import { resolveSecret } from "${runtimeImport}";\n`);
+      }
+    } else {
+      // CommonJS: const { resolveSecret } = require("@shielderx/runtime")
+      const commonJSImport = `const { resolveSecret } = require("${runtimeImport}");`;
+      if (!original.includes(commonJSImport) && 
+          !original.includes(`require("${runtimeImport}")`)) {
+        lines.unshift(commonJSImport + '\n');
       }
     }
-  }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 2) Add bootstrap import BEFORE the runtime import
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
+if (platform.id === "react-native") {
+      // React Native always uses ESM
+      if (!original.includes('import "./shielderx.runtime"')) {
+        lines.unshift('import "./shielderx.runtime";\n');
+      }
+    } else if (platform.id === "javascript") {
+
+       // Node.js: Use CommonJS or ESM based on detection
+      const hasBootstrap = 
+        original.includes('require("./shielderx.runtime")') ||
+        original.includes("require('./shielderx.runtime')") ||
+        original.includes('import "./shielderx.runtime"') ||
+        original.includes("import './shielderx.runtime'");
+
+         if (!hasBootstrap) {
+           if (useESM) {
+          lines.unshift('import "./shielderx.runtime";\n');
+        } else {
+          lines.unshift('require("./shielderx.runtime");\n');
+        }
+         }
+    }
 
 
-       suspendAutoRestore(800);
+
+}
+
+
+suspendAutoRestore(800);
 markInternalOp(file);
 await vscode.workspace.fs.writeFile(
   file,
@@ -3927,24 +4109,86 @@ async function revertProject(extensionContext, ws) {
     );
 
     // 4c️⃣ Remove ANY Shielder runtime import if no resolveSecret remains
-    if (!content.includes("resolveSecret(")) {
-      content = content.replace(
-        /import\s+\{\s*resolveSecret\s*\}\s+from\s+["']@shielder[^"']*["'];?\s*\n?/g,
-        ""
-      );
+// 4c️⃣ Remove ANY Shielder runtime import if no resolveSecret remains
+if (!content.includes("resolveSecret(")) {
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // ES6 IMPORTS (import ... from ...)
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  
+  // Remove: import { resolveSecret } from "@shielderx/runtime"
+  content = content.replace(
+    /import\s+\{\s*resolveSecret\s*\}\s+from\s+["']@shielder[^"']*["'];?\s*\n?/g,
+    ""
+  );
 
-      // Remove old runtime import name
-      content = content.replace(
-        /import\s+["']\.\/shielderx\.runtime["'];?\s*\n?/g,
-        ""
-      );
+  // Remove: import * as shielder from "@shielderx/runtime"
+  content = content.replace(
+    /import\s+\*\s+as\s+\w+\s+from\s+["']@shielder[^"']*["'];?\s*\n?/g,
+    ""
+  );
 
-      // Remove new hidden runtime import name
-      content = content.replace(
-        /import\s+["']\.\/\.shielderx\.runtime["'];?\s*\n?/g,
-        ""
-      );
-    }
+  // Remove: import shielder from "@shielderx/runtime"
+  content = content.replace(
+    /import\s+\w+\s+from\s+["']@shielder[^"']*["'];?\s*\n?/g,
+    ""
+  );
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // COMMONJS REQUIRE (const ... = require(...))
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  
+  // Remove: const { resolveSecret } = require("@shielderx/runtime")
+  content = content.replace(
+    /const\s+\{\s*resolveSecret\s*\}\s*=\s*require\(["']@shielder[^"']*["']\);?\s*\n?/g,
+    ""
+  );
+
+  // Remove: const shielder = require("@shielderx/runtime")
+  content = content.replace(
+    /const\s+\w+\s*=\s*require\(["']@shielder[^"']*["']\);?\s*\n?/g,
+    ""
+  );
+
+  // Remove: let { resolveSecret } = require("@shielderx/runtime")
+  content = content.replace(
+    /let\s+\{\s*resolveSecret\s*\}\s*=\s*require\(["']@shielder[^"']*["']\);?\s*\n?/g,
+    ""
+  );
+
+  // Remove: var { resolveSecret } = require("@shielderx/runtime")
+  content = content.replace(
+    /var\s+\{\s*resolveSecret\s*\}\s*=\s*require\(["']@shielder[^"']*["']\);?\s*\n?/g,
+    ""
+  );
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // REACT NATIVE RUNTIME FILES
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  // Remove: import "./shielderx.runtime"
+  content = content.replace(
+    /import\s+["']\.\/shielderx\.runtime["'];?\s*\n?/g,
+    ""
+  );
+
+  // Remove: import "./.shielderx.runtime"
+  content = content.replace(
+    /import\s+["']\.\/\.shielderx\.runtime["'];?\s*\n?/g,
+    ""
+  );
+
+  // Remove: require("./shielderx.runtime")
+  content = content.replace(
+    /require\(["']\.\/shielderx\.runtime["']\);?\s*\n?/g,
+    ""
+  );
+
+  // Remove: require("./.shielderx.runtime")
+  content = content.replace(
+    /require\(["']\.\/\.shielderx\.runtime["']\);?\s*\n?/g,
+    ""
+  );
+}
 
     // 4d️⃣ Write reverted file safely
     markInternalOp(fileUri);

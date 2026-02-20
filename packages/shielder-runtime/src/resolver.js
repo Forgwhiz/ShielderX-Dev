@@ -1,38 +1,41 @@
-const { loadProjectKey } = require("./key-loader");
-const { loadSecretStore } = require("./store-loader");
-const { decryptPayload } = require("./crypto");
-const {
-  ShielderRuntimeError,
-  ShielderSecretNotFoundError
-} = require("./errors");
+// resolver.js
+// @shielderx/runtime - Node.js version
+
+const { decryptWithKey } = require("./crypto");
 
 function resolveSecret(placeholder) {
-  if (!placeholder || typeof placeholder !== "string") {
-    throw new ShielderRuntimeError("Invalid secret placeholder.");
+  if (!placeholder) return placeholder;
+
+  try {
+    // Get globals (same as React Native)
+    const key = global.__SHIELDER_KEY__ ?? null;
+    const store = global.__SHIELDER_STORE__ ?? null;
+
+    if (!key || !store) {
+      console.error('[ShielderX] Missing key or store in globals');
+      return placeholder;
+    }
+
+    // Find the encrypted entry
+    const entry = (store.secrets || []).find(s => s.placeholder === placeholder);
+    
+    if (!entry) {
+      console.error('[ShielderX] No entry found for:', placeholder);
+      return placeholder;
+    }
+
+    // Check if disabled
+    if (entry.disabled) {
+      return placeholder;
+    }
+
+    // Decrypt
+    const decrypted = decryptWithKey(key, entry.encrypted);
+    return decrypted;
+  } catch (e) {
+    console.error('[ShielderX] Decryption error:', e.message);
+    return placeholder;
   }
-
-  const key = loadProjectKey();
-  const store = loadSecretStore();
-
-  if (!Array.isArray(store.secrets)) {
-    throw new ShielderRuntimeError("Invalid secret store format.");
-  }
-
-  const entry = store.secrets.find(
-    s => s.placeholder === placeholder
-  );
-
-  if (!entry) {
-    throw new ShielderSecretNotFoundError(placeholder);
-  }
-
-  if (entry.disabled) {
-    throw new ShielderRuntimeError(
-      `Secret is disabled: ${placeholder}`
-    );
-  }
-
-  return decryptPayload(entry.encrypted, key);
 }
 
 module.exports = { resolveSecret };
